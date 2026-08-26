@@ -913,11 +913,38 @@ func (b *OGame) execRequest(method, finalURL string, payload, vals url.Values) (
 	if resp.StatusCode != http.StatusOK {
 		b.error("bad status | vals:" + vals.Encode() + " | " + resp.Status)
 	}
+	if isSessionRedirectStatus(resp.StatusCode) {
+		return []byte{}, ogame.ErrNotLogged
+	}
 
-	if resp.StatusCode >= http.StatusInternalServerError {
-		return []byte{}, nil
+	if err := serverError(resp.StatusCode, resp.Status); err != nil {
+		return []byte{}, err
 	}
 	return io.ReadAll(resp.Body)
+}
+
+func serverError(statusCode int, status string) error {
+	if statusCode < http.StatusInternalServerError {
+		return nil
+	}
+
+	if strings.TrimSpace(status) == "" {
+		return fmt.Errorf("server returned HTTP status %d", statusCode)
+	}
+	return fmt.Errorf("server returned HTTP status %s", status)
+}
+
+func isSessionRedirectStatus(statusCode int) bool {
+	switch statusCode {
+	case http.StatusMovedPermanently,
+		http.StatusFound,
+		http.StatusSeeOther,
+		http.StatusTemporaryRedirect,
+		http.StatusPermanentRedirect:
+		return true
+	default:
+		return false
+	}
 }
 
 func getPageName(vals url.Values) string {
@@ -2518,9 +2545,9 @@ func (b *OGame) traderImportExportTrade(price int64, importToken string, planetR
 	// v12: {"message":"You have bought a container.","error":false,"item":{...},"newToken":"..."}
 	// v13: {"message":"...","success":true,"item":{...},"newAjaxToken":"..."} or {"message":"...","success":false,"errors":[{"message":"..."}]}
 	var result struct {
-		Message      string
-		Error        json.RawMessage
-		Errors       []struct {
+		Message string
+		Error   json.RawMessage
+		Errors  []struct {
 			Message string
 		}
 		NewAjaxToken string
@@ -2555,9 +2582,9 @@ func (b *OGame) traderImportExportTakeItem(token string) error {
 		return err
 	}
 	var result struct {
-		Message      string
-		Error        json.RawMessage
-		Errors       []struct {
+		Message string
+		Error   json.RawMessage
+		Errors  []struct {
 			Message string
 		}
 		NewAjaxToken string
@@ -3753,15 +3780,40 @@ func (b *OGame) miniFleetSpy(coord ogame.Coordinate, shipCount int64, options ..
 }
 
 func (b *OGame) getPageMessages(page int64, tabid ogame.MessagesTabID) ([]byte, error) {
-	payload := url.Values{
+	payload := buildMessagesPayload(page, tabid)
+	return b.postPageContent(url.Values{"page": {"componentOnly"}, "component": {"messages"}, "asJson": {"1"}, "action": {"getMessagesList"}}, payload)
+}
+
+func buildMessagesPayload(page int64, tabid ogame.MessagesTabID) url.Values {
+	if page < 1 {
+		page = 1
+	}
+
+	return url.Values{
 		"activeSubTab": {utils.FI64(tabid)},
 		"showTrash":    {"false"},
+		"pagination":   {utils.FI64(page)},
 	}
-	return b.postPageContent(url.Values{"page": {"componentOnly"}, "component": {"messages"}, "asJson": {"1"}, "action": {"getMessagesList"}}, payload)
 }
 
 func (b *OGame) getEspionageReportMessages(maxPage int64) ([]ogame.EspionageReportSummary, error) {
 	return getMessages(b, maxPage, EspionageMessagesTabID, b.extractor.ExtractEspionageReportMessageIDs)
+}
+
+// getEspionageReportMessagesPage returns exactly one message page. The bot uses
+// this endpoint while processing AutoFarm reports so it can stop at its durable
+// report boundary without loading the entire mailbox first.
+func (b *OGame) getEspionageReportMessagesPage(page int64) ([]ogame.EspionageReportSummary, error) {
+	if page < 1 {
+		page = 1
+	}
+
+	pageJSON, err := b.getPageMessages(page, EspionageMessagesTabID)
+	if err != nil {
+		return nil, fmt.Errorf("unable to retrieve espionage messages page %d: %w", page, err)
+	}
+
+	return extractMessagesPage(pageJSON, page, b.extractor.ExtractEspionageReportMessageIDs)
 }
 
 func (b *OGame) getCombatReportMessages(maxPage int64) ([]ogame.CombatReportSummary, error) {
@@ -3772,23 +3824,130 @@ func (b *OGame) getExpeditionMessages(maxPage int64) ([]ogame.ExpeditionMessage,
 	return getMessages(b, maxPage, ExpeditionsMessagesTabID, b.extractor.ExtractExpeditionMessages)
 }
 
+func parseMessagesResponse(pageJSON []byte) ([]string, string, error) {
+	var response struct {
+		Status  string `json:"status"`
+		Message string `json:"message"`
+		Errors  []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+		Messages     []json.RawMessage `json:"messages"`
+		NewAjaxToken string            `json:"newAjaxToken"`
+	}
+	if err := json.Unmarshal(pageJSON, &response); err != nil {
+		return nil, "", errors.New("unable to parse messages response: " + err.Error())
+	}
+
+	status := strings.ToLower(strings.TrimSpace(response.Status))
+	if (status != "" && status != "success") || len(response.Errors) > 0 {
+		message := strings.TrimSpace(response.Message)
+		if message == "" && len(response.Errors) > 0 {
+			message = strings.TrimSpace(response.Errors[0].Message)
+		}
+		if message == "" {
+			message = status
+		}
+		if message == "" {
+			message = "unknown server error"
+		}
+		return nil, "", errors.New("messages request failed: " + message)
+	}
+
+	messages := make([]string, 0, len(response.Messages))
+	for index, rawMessage := range response.Messages {
+		var message string
+		if err := json.Unmarshal(rawMessage, &message); err != nil {
+			return nil, "", fmt.Errorf("messages[%d] is not a string: %w", index, err)
+		}
+		messages = append(messages, message)
+	}
+
+	return messages, response.NewAjaxToken, nil
+}
+
 func getMessages[T any](b *OGame, maxPage int64, tabID ogame.MessagesTabID, extractor func([]byte) ([]T, int64, error)) ([]T, error) {
-	var res struct {
-		ServerLang   string `json:"js_serverlang"`
-		ServerID     string `json:"js_serverid"`
-		Status       string `json:"status"`
-		Messages     []any  `json:"messages"`
-		Components   []any  `json:"components"`
-		NewAjaxToken string `json:"newAjaxToken"`
+	return collectMessagesPages(
+		maxPage,
+		func(page int64) ([]byte, error) {
+			return b.getPageMessages(page, tabID)
+		},
+		extractor,
+		func() { time.Sleep(utils.RandMs(500, 1500)) },
+	)
+}
+
+func extractMessagesPage[T any](pageJSON []byte, page int64, extractor func([]byte) ([]T, int64, error)) ([]T, error) {
+	if extractor == nil {
+		return nil, errors.New("messages extractor is nil")
 	}
-	pageHTML, _ := b.getPageMessages(1, tabID)
-	_ = json.Unmarshal(pageHTML, &res)
+
+	messageHTML, _, err := parseMessagesResponse(pageJSON)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse messages page %d: %w", page, err)
+	}
+
+	messages := make([]T, 0)
+	for index, message := range messageHTML {
+		newMessages, _, err := extractor([]byte(message))
+		if err != nil {
+			return nil, fmt.Errorf("unable to extract messages page %d item %d: %w", page, index, err)
+		}
+		messages = append(messages, newMessages...)
+	}
+
+	return messages, nil
+}
+
+func collectMessagesPages[T any](
+	maxPage int64,
+	fetchPage func(int64) ([]byte, error),
+	extractor func([]byte) ([]T, int64, error),
+	betweenPages func(),
+) ([]T, error) {
+	if fetchPage == nil {
+		return nil, errors.New("messages page loader is nil")
+	}
+	if extractor == nil {
+		return nil, errors.New("messages extractor is nil")
+	}
+
+	page := int64(1)
+	totalPages := int64(1)
 	msgs := make([]T, 0)
-	for _, m := range res.Messages {
-		doc := ([]byte)(m.(string))
-		newMessage, _, _ := extractor(doc)
-		msgs = append(msgs, newMessage...)
+	for page <= totalPages {
+		if maxPage >= 1 && page > maxPage {
+			break
+		}
+		if page > 1 && betweenPages != nil {
+			betweenPages()
+		}
+
+		pageJSON, err := fetchPage(page)
+		if err != nil {
+			return nil, fmt.Errorf("unable to retrieve messages page %d: %w", page, err)
+		}
+		messageHTML, _, err := parseMessagesResponse(pageJSON)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse messages page %d: %w", page, err)
+		}
+
+		pageCount := int64(1)
+		for index, message := range messageHTML {
+			newMessage, messagePages, err := extractor([]byte(message))
+			if err != nil {
+				return nil, fmt.Errorf("unable to extract messages page %d item %d: %w", page, index, err)
+			}
+			msgs = append(msgs, newMessage...)
+			if messagePages > pageCount {
+				pageCount = messagePages
+			}
+		}
+		if pageCount > totalPages {
+			totalPages = pageCount
+		}
+		page++
 	}
+
 	return msgs, nil
 }
 
@@ -3858,20 +4017,20 @@ func (b *OGame) getMarketplaceMessages(maxPage int64, tabID ogame.MessagesTabID)
 }
 
 func (b *OGame) getExpeditionMessageAt(t time.Time) (ogame.ExpeditionMessage, error) {
-	pageHTML, _ := b.getPageMessages(1, ExpeditionsMessagesTabID)
-	var res struct {
-		ServerLang   string `json:"js_serverlang"`
-		ServerID     string `json:"js_serverid"`
-		Status       string `json:"status"`
-		Messages     []any  `json:"messages"`
-		Components   []any  `json:"components"`
-		NewAjaxToken string `json:"newAjaxToken"`
+	pageHTML, err := b.getPageMessages(1, ExpeditionsMessagesTabID)
+	if err != nil {
+		return ogame.ExpeditionMessage{}, err
 	}
-	_ = json.Unmarshal(pageHTML, &res)
+	messageHTML, _, err := parseMessagesResponse(pageHTML)
+	if err != nil {
+		return ogame.ExpeditionMessage{}, err
+	}
 	newMessages := make([]ogame.ExpeditionMessage, 0)
-	for _, m := range res.Messages {
-		doc := ([]byte)(m.(string))
-		newMessage, _, _ := b.extractor.ExtractExpeditionMessages(doc)
+	for index, message := range messageHTML {
+		newMessage, _, err := b.extractor.ExtractExpeditionMessages([]byte(message))
+		if err != nil {
+			return ogame.ExpeditionMessage{}, fmt.Errorf("unable to extract expedition messages[%d]: %w", index, err)
+		}
 		newMessages = append(newMessages, newMessage...)
 	}
 	for _, m := range newMessages {
@@ -3890,22 +4049,19 @@ func (b *OGame) getCombatReportSummaries() ([]ogame.CombatReportSummary, error) 
 	if err != nil {
 		return nil, err
 	}
-	var res struct {
-		ServerLang   string `json:"js_serverlang"`
-		ServerID     string `json:"js_serverid"`
-		Status       string `json:"status"`
-		Messages     []any  `json:"messages"`
-		Components   []any  `json:"components"`
-		NewAjaxToken string `json:"newAjaxToken"`
+	messageHTML, _, err := parseMessagesResponse(pageHTML)
+	if err != nil {
+		return nil, err
 	}
-	_ = json.Unmarshal(pageHTML, &res)
 	newMessages := make([]ogame.CombatReportSummary, 0)
-	for i, m := range res.Messages {
+	for i, message := range messageHTML {
 		if i > 40 {
 			break
 		}
-		doc := ([]byte)(m.(string))
-		newMessage, _, _ := b.extractor.ExtractCombatReportMessagesSummary(doc)
+		newMessage, _, err := b.extractor.ExtractCombatReportMessagesSummary([]byte(message))
+		if err != nil {
+			return nil, fmt.Errorf("unable to extract combat messages[%d]: %w", i, err)
+		}
 		newMessages = append(newMessages, newMessage...)
 	}
 	return newMessages, nil
@@ -3950,22 +4106,19 @@ func (b *OGame) getEspionageReportFor(coord ogame.Coordinate) (ogame.EspionageRe
 	if err != nil {
 		return ogame.EspionageReport{}, err
 	}
-	var res struct {
-		ServerLang   string `json:"js_serverlang"`
-		ServerID     string `json:"js_serverid"`
-		Status       string `json:"status"`
-		Messages     []any  `json:"messages"`
-		Components   []any  `json:"components"`
-		NewAjaxToken string `json:"newAjaxToken"`
+	messageHTML, _, err := parseMessagesResponse(pageHTML)
+	if err != nil {
+		return ogame.EspionageReport{}, err
 	}
-	_ = json.Unmarshal(pageHTML, &res)
 	newMessages := make([]ogame.EspionageReportSummary, 0)
-	for i, m := range res.Messages {
+	for i, message := range messageHTML {
 		if i > 40 {
 			break
 		}
-		doc := ([]byte)(m.(string))
-		newMessage, _, _ := b.extractor.ExtractEspionageReportMessageIDs(doc)
+		newMessage, _, err := b.extractor.ExtractEspionageReportMessageIDs([]byte(message))
+		if err != nil {
+			return ogame.EspionageReport{}, fmt.Errorf("unable to extract espionage messages[%d]: %w", i, err)
+		}
 		newMessages = append(newMessages, newMessage...)
 	}
 	for _, m := range newMessages {
@@ -3977,17 +4130,18 @@ func (b *OGame) getEspionageReportFor(coord ogame.Coordinate) (ogame.EspionageRe
 }
 
 func (b *OGame) getDeleteMessagesToken() (string, error) {
-	var tmp struct {
-		NewAjaxToken string
-	}
 	pageJson, err := b.getPageMessages(1, EspionageMessagesTabID)
 	if err != nil {
 		return "", err
 	}
-	if err := json.Unmarshal(pageJson, &tmp); err != nil {
+	_, token, err := parseMessagesResponse(pageJson)
+	if err != nil {
 		return "", err
 	}
-	return tmp.NewAjaxToken, nil
+	if strings.TrimSpace(token) == "" {
+		return "", errors.New("messages response did not contain an ajax token")
+	}
+	return token, nil
 }
 
 func (b *OGame) deleteMessage(msgID int64) error {
@@ -4065,13 +4219,30 @@ func (b *OGame) deleteAllMessagesFromTab(tabID ogame.MessagesTabID) error {
 		"token":        {token},
 	}
 	pageHTML, err := b.postPageContent(url.Values{"page": {"componentOnly"}, "component": {"messages"}, "action": {"flagDeleteAll"}}, payload)
-	var res struct {
-		Status       string `json:"status"`
-		Message      string `json:"message"`
-		NewAjaxToken string `json:"newAjaxToken"`
+	if err != nil {
+		return err
 	}
-	_ = json.Unmarshal(pageHTML, &res)
-	return err
+	return parseDeleteAllMessagesResponse(pageHTML)
+}
+
+func parseDeleteAllMessagesResponse(pageHTML []byte) error {
+	var response struct {
+		Status  string `json:"status"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(pageHTML, &response); err != nil {
+		return errors.New("unable to parse delete messages response")
+	}
+
+	if !strings.EqualFold(strings.TrimSpace(response.Status), "success") {
+		message := strings.TrimSpace(response.Message)
+		if message == "" {
+			message = "unknown server error"
+		}
+		return errors.New("unable to delete messages: " + message)
+	}
+
+	return nil
 }
 
 func energyProduced(temp ogame.Temperature, resourcesBuildings ogame.ResourcesBuildings, resSettings ogame.ResourceSettings, energyTechnology int64) int64 {

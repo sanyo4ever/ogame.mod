@@ -2,16 +2,195 @@ package wrapper
 
 import (
 	"bytes"
+	"errors"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/alaingilbert/ogame/pkg/device"
 	"github.com/alaingilbert/ogame/pkg/ogame"
 	"github.com/alaingilbert/ogame/pkg/utils"
 	"github.com/hashicorp/go-version"
 	"github.com/stretchr/testify/assert"
+	"net/http"
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 )
+
+func TestParseDeleteAllMessagesResponse(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		wantErr error
+	}{
+		{
+			name:    "success",
+			payload: `{"status":"success","message":""}`,
+		},
+		{
+			name:    "application error",
+			payload: `{"status":"error","message":"invalid token"}`,
+			wantErr: errors.New("unable to delete messages: invalid token"),
+		},
+		{
+			name:    "malformed response",
+			payload: `not-json`,
+			wantErr: errors.New("unable to parse delete messages response"),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := parseDeleteAllMessagesResponse([]byte(test.payload))
+			if test.wantErr == nil {
+				if err != nil {
+					t.Fatalf("expected success, got %v", err)
+				}
+				return
+			}
+
+			if err == nil || err.Error() != test.wantErr.Error() {
+				t.Fatalf("expected error %q, got %v", test.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestParseMessagesResponse(t *testing.T) {
+	tests := []struct {
+		name       string
+		payload    string
+		want       []string
+		wantToken  string
+		wantErrMsg string
+	}{
+		{
+			name:      "v13 success response",
+			payload:   `{"status":"success","showPaginator":false,"messages":["<div data-msg-id=\"42\">one</div>","<div data-msg-id=\"43\">two</div>"],"newAjaxToken":"next-token"}`,
+			want:      []string{`<div data-msg-id="42">one</div>`, `<div data-msg-id="43">two</div>`},
+			wantToken: "next-token",
+		},
+		{
+			name:       "server failure",
+			payload:    `{"status":"failure","errors":[{"message":"invalid token"}]}`,
+			wantErrMsg: "invalid token",
+		},
+		{
+			name:       "malformed json",
+			payload:    `not-json`,
+			wantErrMsg: "unable to parse messages response",
+		},
+		{
+			name:       "message is not html string",
+			payload:    `{"status":"success","messages":[{"unexpected":"object"}]}`,
+			wantErrMsg: "messages[0] is not a string",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			messages, token, err := parseMessagesResponse([]byte(test.payload))
+			if test.wantErrMsg == "" {
+				if err != nil {
+					t.Fatalf("expected success, got %v", err)
+				}
+				assert.Equal(t, test.want, messages)
+				assert.Equal(t, test.wantToken, token)
+				return
+			}
+
+			if err == nil || !strings.Contains(err.Error(), test.wantErrMsg) {
+				t.Fatalf("expected error containing %q, got %v", test.wantErrMsg, err)
+			}
+		})
+	}
+}
+
+func TestMessagesRequestPayloadCarriesTheRequestedPage(t *testing.T) {
+	payload := buildMessagesPayload(3, EspionageMessagesTabID)
+
+	assert.Equal(t, "3", payload.Get("pagination"))
+	assert.Equal(t, "20", payload.Get("activeSubTab"))
+	assert.Equal(t, "false", payload.Get("showTrash"))
+}
+
+func TestCollectMessagesPagesPreservesPageOrderAndHonorsMaxPage(t *testing.T) {
+	pages := map[int]string{
+		1: `{"status":"success","messages":["<div data-page=\"1\">one</div>"]}`,
+		2: `{"status":"success","messages":["<div data-page=\"2\">two</div>"]}`,
+		3: `{"status":"success","messages":["<div data-page=\"3\">three</div>"]}`,
+	}
+	requestedPages := make([]int64, 0)
+	fetch := func(page int64) ([]byte, error) {
+		requestedPages = append(requestedPages, page)
+		return []byte(pages[int(page)]), nil
+	}
+	extractor := func(pageHTML []byte) ([]string, int64, error) {
+		text := string(pageHTML)
+		if strings.Contains(text, `data-page="1"`) {
+			return []string{"one"}, 3, nil
+		}
+		if strings.Contains(text, `data-page="2"`) {
+			return []string{"two"}, 3, nil
+		}
+		return []string{"three"}, 3, nil
+	}
+
+	all, err := collectMessagesPages(-1, fetch, extractor, nil)
+	if err != nil {
+		t.Fatalf("collect all pages: %v", err)
+	}
+	assert.Equal(t, []string{"one", "two", "three"}, all)
+	assert.Equal(t, []int64{1, 2, 3}, requestedPages)
+
+	requestedPages = requestedPages[:0]
+	limited, err := collectMessagesPages(2, fetch, extractor, nil)
+	if err != nil {
+		t.Fatalf("collect limited pages: %v", err)
+	}
+	assert.Equal(t, []string{"one", "two"}, limited)
+	assert.Equal(t, []int64{1, 2}, requestedPages)
+}
+
+func TestExtractMessagesPageOnlyExtractsTheRequestedPage(t *testing.T) {
+	payload := []byte(`{"status":"success","messages":["<div data-msg-id=\"41\">one</div>","<div data-msg-id=\"42\">two</div>"]}`)
+
+	items, err := extractMessagesPage(payload, 4, func(message []byte) ([]string, int64, error) {
+		if !strings.Contains(string(message), "data-msg-id") {
+			t.Fatalf("unexpected message payload: %s", message)
+		}
+		return []string{string(message)}, 40, nil
+	})
+
+	if err != nil {
+		t.Fatalf("extract page: %v", err)
+	}
+	assert.Len(t, items, 2)
+}
+
+func TestSessionRedirectStatusesAreRetriedAsLoggedOut(t *testing.T) {
+	for _, statusCode := range []int{
+		http.StatusMovedPermanently,
+		http.StatusFound,
+		http.StatusSeeOther,
+		http.StatusTemporaryRedirect,
+		http.StatusPermanentRedirect,
+	} {
+		assert.True(t, isSessionRedirectStatus(statusCode), "status %d", statusCode)
+	}
+
+	assert.False(t, isSessionRedirectStatus(http.StatusNotModified))
+	assert.False(t, isSessionRedirectStatus(http.StatusOK))
+}
+
+func TestServerErrorsArePropagatedToTheRetryLayer(t *testing.T) {
+	err := serverError(http.StatusServiceUnavailable, "503 Service Unavailable")
+
+	if err == nil {
+		t.Fatal("expected a server error to be returned")
+	}
+	assert.Contains(t, err.Error(), "503 Service Unavailable")
+	assert.NoError(t, serverError(http.StatusOK, "200 OK"))
+}
 
 func BenchmarkUserInfoRegex(b *testing.B) {
 	extractUserRegex := func(pageHTML []byte) (int, string) {

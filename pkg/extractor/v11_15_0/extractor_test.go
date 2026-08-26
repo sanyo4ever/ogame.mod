@@ -16,7 +16,7 @@ func TestExtractEspionageReport(t *testing.T) {
 	e.SetLocation(time.FixedZone("OGT", 3600))
 	infos, err := e.ExtractEspionageReport(pageHTMLBytes)
 	assert.NoError(t, err)
-	assert.Equal(t, time.Date(2024, 05, 23, 14, 20, 42, 0, time.Local), infos.Date) // "23.05.2024 22:20:42"
+	assert.Equal(t, time.Date(2024, 05, 23, 22, 20, 42, 0, time.FixedZone("OGT", 3600)).UTC(), infos.Date.UTC()) // "23.05.2024 22:20:42" in OGT (+01:00)
 	assert.Equal(t, "Hmoa", infos.Username)
 	assert.Equal(t, ogame.Collector, infos.CharacterClass)
 	assert.Equal(t, int64(2_920_000), infos.Resources.Metal)

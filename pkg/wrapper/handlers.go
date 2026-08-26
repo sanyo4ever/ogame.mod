@@ -230,6 +230,19 @@ func HasTechnocratHandler(c echo.Context) error {
 // GetEspionageReportMessagesHandler ...
 func GetEspionageReportMessagesHandler(c echo.Context) error {
 	bot := c.Get("bot").(*OGame)
+	if pageValue := c.QueryParam("page"); pageValue != "" {
+		page, err := utils.ParseI64(pageValue)
+		if err != nil || page < 1 {
+			return c.JSON(http.StatusBadRequest, ErrorResp(400, "invalid espionage report page"))
+		}
+
+		report, err := bot.getEspionageReportMessagesPage(page)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, ErrorResp(500, err.Error()))
+		}
+		return c.JSON(http.StatusOK, SuccessResp(report))
+	}
+
 	report, err := bot.GetEspionageReportMessages(-1)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, ErrorResp(500, err.Error()))
