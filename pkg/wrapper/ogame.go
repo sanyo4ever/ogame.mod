@@ -876,7 +876,100 @@ func (b *OGame) preRequestChecks() error {
 	return nil
 }
 
-func (b *OGame) execRequest(method, finalURL string, payload, vals url.Values) ([]byte, error) {
+type requestResponse struct {
+	statusCode int
+	location   string
+}
+
+// ErrActionRedirect identifies a redirect returned by a state-changing
+// request. The request is never replayed automatically; the caller must
+// classify the redirect and reconcile the resulting game state when needed.
+var ErrActionRedirect = errors.New("state-changing request returned a redirect")
+
+type requestRedirectError struct {
+	statusCode int
+	location   string
+	normal     bool
+}
+
+func (e *requestRedirectError) Error() string {
+	if e.location == "" {
+		return fmt.Sprintf("request returned HTTP redirect %d without a location", e.statusCode)
+	}
+	return fmt.Sprintf("request returned HTTP redirect %d to %s", e.statusCode, e.location)
+}
+
+func (e *requestRedirectError) Unwrap() error {
+	return ErrActionRedirect
+}
+
+func isRedirectStatus(statusCode int) bool {
+	return statusCode >= http.StatusMultipleChoices && statusCode < http.StatusBadRequest
+}
+
+// isSessionRedirect distinguishes an actual login/session redirect from the
+// internal redirects OGame sends after some successful actions. OGame v13's
+// discovery action can return 302 to another in-game page after creating the
+// fleet, so status alone is not evidence that the session expired.
+func isSessionRedirect(statusCode int, location, serverURL string) bool {
+	if !isRedirectStatus(statusCode) {
+		return false
+	}
+	if strings.TrimSpace(location) == "" {
+		return true
+	}
+
+	base, err := url.Parse(serverURL)
+	if err != nil || base.Scheme == "" || base.Host == "" {
+		return true
+	}
+	target, err := url.Parse(location)
+	if err != nil {
+		return true
+	}
+	target = base.ResolveReference(target)
+	if !strings.EqualFold(target.Scheme, base.Scheme) || !strings.EqualFold(target.Host, base.Host) {
+		return true
+	}
+
+	path := strings.TrimSuffix(strings.ToLower(target.Path), "/")
+	page := strings.ToLower(strings.TrimSpace(target.Query().Get("page")))
+	if path != "/game/index.php" || page == "login" || page == "lobbylogin" || page == "logout" {
+		return true
+	}
+	return false
+}
+
+// isNormalDiscoveryRedirect identifies the redirect returned by OGame after
+// the v13 discovery action. The action is applied before OGame redirects back
+// to an in-game page, so this is a successful protocol response, not a login
+// redirect. The fleet state is still reconciled by sendDiscoveryFleet before
+// the operation is reported as successful.
+func isNormalDiscoveryRedirect(method string, vals url.Values, statusCode int, location, serverURL string) bool {
+	if method != http.MethodPost || vals.Get("page") != "ingame" ||
+		vals.Get("component") != "fleetdispatch" || vals.Get("action") != "sendDiscoveryFleet" {
+		return false
+	}
+	if !isRedirectStatus(statusCode) || isSessionRedirect(statusCode, location, serverURL) {
+		return false
+	}
+
+	target, err := url.Parse(location)
+	if err != nil {
+		return false
+	}
+	base, err := url.Parse(serverURL)
+	if err != nil {
+		return false
+	}
+	target = base.ResolveReference(target)
+	query := target.Query()
+	return strings.EqualFold(strings.TrimSuffix(target.Path, "/"), "/game/index.php") &&
+		strings.EqualFold(strings.TrimSpace(query.Get("page")), "ingame")
+}
+
+func (b *OGame) execRequest(method, finalURL string, payload, vals url.Values) ([]byte, requestResponse, error) {
+	var response requestResponse
 	var body io.Reader
 	if method == http.MethodPost {
 		body = strings.NewReader(payload.Encode())
@@ -884,7 +977,7 @@ func (b *OGame) execRequest(method, finalURL string, payload, vals url.Values) (
 
 	req, err := http.NewRequest(method, finalURL, body)
 	if err != nil {
-		return []byte{}, err
+		return []byte{}, response, err
 	}
 
 	if method == http.MethodPost {
@@ -906,21 +999,24 @@ func (b *OGame) execRequest(method, finalURL string, payload, vals url.Values) (
 		resp, err = b.device.GetClient().Do(req)
 	}
 	if err != nil {
-		return []byte{}, err
+		return []byte{}, response, err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		b.error("bad status | vals:" + vals.Encode() + " | " + resp.Status)
+	response = requestResponse{
+		statusCode: resp.StatusCode,
+		location:   resp.Header.Get("Location"),
 	}
-	if isSessionRedirectStatus(resp.StatusCode) {
-		return []byte{}, ogame.ErrNotLogged
+	if resp.StatusCode != http.StatusOK &&
+		!(isRedirectStatus(resp.StatusCode) && !isSessionRedirect(resp.StatusCode, response.location, b.cache.serverURL)) {
+		b.error("bad status | vals:" + vals.Encode() + " | " + resp.Status)
 	}
 
 	if err := serverError(resp.StatusCode, resp.Status); err != nil {
-		return []byte{}, err
+		return []byte{}, response, err
 	}
-	return io.ReadAll(resp.Body)
+	by, err := io.ReadAll(resp.Body)
+	return by, response, err
 }
 
 func serverError(statusCode int, status string) error {
@@ -932,19 +1028,6 @@ func serverError(statusCode int, status string) error {
 		return fmt.Errorf("server returned HTTP status %d", statusCode)
 	}
 	return fmt.Errorf("server returned HTTP status %s", status)
-}
-
-func isSessionRedirectStatus(statusCode int) bool {
-	switch statusCode {
-	case http.StatusMovedPermanently,
-		http.StatusFound,
-		http.StatusSeeOther,
-		http.StatusTemporaryRedirect,
-		http.StatusPermanentRedirect:
-		return true
-	default:
-		return false
-	}
 }
 
 func getPageName(vals url.Values) string {
@@ -1046,9 +1129,24 @@ func (b *OGame) pageContent(method string, vals, payload url.Values, opts ...Opt
 			return err
 		}
 
-		pageHTMLBytes, err = b.execRequest(method, finalURL, payload, vals)
+		var response requestResponse
+		pageHTMLBytes, response, err = b.execRequest(method, finalURL, payload, vals)
 		if err != nil {
 			return err
+		}
+
+		if isRedirectStatus(response.statusCode) {
+			if isSessionRedirect(response.statusCode, response.location, b.cache.serverURL) {
+				b.error("Err not logged on redirect from page : ", page)
+				saveNotLoggedHTML(page, pageHTMLBytes)
+				b.isConnectedAtom.Store(false)
+				return ogame.ErrNotLogged
+			}
+			return &requestRedirectError{
+				statusCode: response.statusCode,
+				location:   response.location,
+				normal:     isNormalDiscoveryRedirect(method, vals, response.statusCode, response.location, b.cache.serverURL),
+			}
 		}
 
 		if detectLoggedOut(method, page, vals, pageHTMLBytes) {
@@ -1063,7 +1161,10 @@ func (b *OGame) pageContent(method string, vals, payload url.Values, opts ...Opt
 
 	retryPolicy := retryPolicyFromConfig(b, cfg)
 	if err := retryPolicy(clb); err != nil {
-		b.error(err)
+		var redirectErr *requestRedirectError
+		if !errors.As(err, &redirectErr) || !redirectErr.normal {
+			b.error(err)
+		}
 		return []byte{}, err
 	}
 
@@ -1225,6 +1326,12 @@ func (b *OGame) withRetry(fn func() error) error {
 		err := fn()
 		if err == nil {
 			return nil
+		}
+		// A redirect after a state-changing request is not safe to replay: the
+		// server may already have applied the action. The caller must reconcile
+		// the game state first.
+		if errors.Is(err, ErrActionRedirect) {
+			return err
 		}
 		// If we manually logged out, do not try to auto re login.
 		if err := b.parentCtx.Err(); err != nil {
@@ -4466,6 +4573,13 @@ func (b *OGame) getTasks() (out taskRunner.TasksOverview) {
 	return b.taskRunnerInst.GetTasks()
 }
 
+func discoveryActionToken(currentToken, pageToken string) string {
+	if token := strings.TrimSpace(currentToken); token != "" {
+		return token
+	}
+	return pageToken
+}
+
 func (b *OGame) sendDiscoveryFleet(celestialID ogame.CelestialID, coord ogame.Coordinate, options ...Option) error {
 	options = append(options, ChangePlanet(celestialID))
 	// Check if the sendDiscoveryFleet button is available for the target.
@@ -4491,7 +4605,22 @@ func (b *OGame) sendDiscoveryFleet(celestialID ogame.CelestialID, coord ogame.Co
 		}
 	}
 
+	// Keep a fleet watermark before the state-changing request. If OGame
+	// answers with its normal internal redirect, an existing fleet on the same
+	// route must not be mistaken for the fleet created by this request.
+	origin, err := b.getCachedCelestialByID(celestialID)
+	if err != nil {
+		return err
+	}
+	initialFleets, _, err := b.getFleets(SkipRetry)
+	if err != nil {
+		return err
+	}
+	initialFleetIDs := discoveryFleetIDs(initialFleets, origin.GetCoordinate(), coord)
+
 	// Send fleet.
+	sendOptions := append([]Option{}, options...)
+	sendOptions = append(sendOptions, SkipRetry)
 	res, err := b.postPageContent(url.Values{
 		"page":      {"ingame"},
 		"component": {"fleetdispatch"},
@@ -4502,9 +4631,15 @@ func (b *OGame) sendDiscoveryFleet(celestialID ogame.CelestialID, coord ogame.Co
 		"galaxy":   {utils.FI64(coord.Galaxy)},
 		"system":   {utils.FI64(coord.System)},
 		"position": {utils.FI64(coord.Position)},
-		"token":    {galaxyPage.Token},
-	})
+		"token":    {discoveryActionToken(b.cache.token, galaxyPage.Token)},
+	}, sendOptions...)
 	if err != nil {
+		var redirectErr *requestRedirectError
+		if errors.As(err, &redirectErr) && redirectErr.normal {
+			if confirmErr := b.confirmDiscoveryFleetDispatched(celestialID, coord, initialFleetIDs); confirmErr == nil {
+				return nil
+			}
+		}
 		return err
 	}
 
@@ -4523,6 +4658,68 @@ func (b *OGame) sendDiscoveryFleet(celestialID ogame.CelestialID, coord ogame.Co
 		return errors.New(resStruct.Response.Message)
 	}
 	return nil
+}
+
+func discoveryFleetIDs(fleets []ogame.Fleet, origin, destination ogame.Coordinate) map[ogame.FleetID]struct{} {
+	ids := make(map[ogame.FleetID]struct{})
+	for _, fleet := range fleets {
+		if fleet.Mission == ogame.SearchForLifeforms &&
+			!fleet.ReturnFlight &&
+			fleet.Origin.Equal(origin) &&
+			fleet.Destination.Equal(destination) {
+			ids[fleet.ID] = struct{}{}
+		}
+	}
+	return ids
+}
+
+func (b *OGame) confirmDiscoveryFleetDispatched(celestialID ogame.CelestialID, destination ogame.Coordinate, initialFleetIDs map[ogame.FleetID]struct{}) error {
+	origin, err := b.getCachedCelestialByID(celestialID)
+	if err != nil {
+		return err
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		fleets, _, err := b.getFleets(SkipRetry)
+		if err == nil {
+			for _, fleet := range fleets {
+				_, wasActiveBefore := initialFleetIDs[fleet.ID]
+				if fleet.Mission == ogame.SearchForLifeforms &&
+					fleet.ID > 0 &&
+					!wasActiveBefore &&
+					!fleet.ReturnFlight &&
+					fleet.Origin.Equal(origin.GetCoordinate()) &&
+					fleet.Destination.Equal(destination) {
+					return nil
+				}
+			}
+		} else {
+			lastErr = err
+		}
+
+		if attempt < 2 {
+			timer := time.NewTimer(300 * time.Millisecond)
+			select {
+			case <-timer.C:
+			case <-b.parentCtx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return b.parentCtx.Err()
+			case <-b.ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return ogame.ErrBotInactive
+			}
+		}
+	}
+
+	if lastErr != nil {
+		return fmt.Errorf("unable to verify discovery fleet dispatch: %w", lastErr)
+	}
+	return errors.New("unable to verify discovery fleet dispatch")
 }
 
 func (b *OGame) sendDiscoveryFleet2(celestialID ogame.CelestialID, coord ogame.Coordinate, options ...Option) (ogame.Fleet, error) {
@@ -4565,7 +4762,7 @@ func (b *OGame) sendSystemDiscoveryFleet(celestialID ogame.CelestialID, galaxy, 
 	}, url.Values{
 		"galaxy": {utils.FI64(galaxy)},
 		"system": {utils.FI64(system)},
-		"token":  {galaxyPage.Token},
+		"token":  {discoveryActionToken(b.cache.token, galaxyPage.Token)},
 	})
 	if err != nil {
 		return nil, err

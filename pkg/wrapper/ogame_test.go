@@ -9,7 +9,10 @@ import (
 	"github.com/alaingilbert/ogame/pkg/utils"
 	"github.com/hashicorp/go-version"
 	"github.com/stretchr/testify/assert"
+	"log"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -167,19 +170,141 @@ func TestExtractMessagesPageOnlyExtractsTheRequestedPage(t *testing.T) {
 	assert.Len(t, items, 2)
 }
 
-func TestSessionRedirectStatusesAreRetriedAsLoggedOut(t *testing.T) {
-	for _, statusCode := range []int{
-		http.StatusMovedPermanently,
+func TestRedirectClassificationUsesTheRedirectTarget(t *testing.T) {
+	serverURL := "https://s176-pt.ogame.gameforge.com"
+
+	assert.False(t, isSessionRedirect(
 		http.StatusFound,
-		http.StatusSeeOther,
-		http.StatusTemporaryRedirect,
-		http.StatusPermanentRedirect,
-	} {
-		assert.True(t, isSessionRedirectStatus(statusCode), "status %d", statusCode)
+		serverURL+"/game/index.php?page=ingame&component=overview&displayError=1",
+		serverURL,
+	))
+	assert.True(t, isSessionRedirect(
+		http.StatusFound,
+		"https://lobby.gameforge.com/login",
+		serverURL,
+	))
+	assert.True(t, isSessionRedirect(
+		http.StatusFound,
+		serverURL+"/game/index.php?page=login",
+		serverURL,
+	))
+	assert.True(t, isSessionRedirect(http.StatusFound, "", serverURL))
+	assert.False(t, isSessionRedirect(http.StatusOK, "", serverURL))
+}
+
+func TestDiscoveryRedirectIsClassifiedAsNormalInternalAction(t *testing.T) {
+	serverURL := "https://s176-pt.ogame.gameforge.com"
+	vals := url.Values{
+		"page":      {"ingame"},
+		"component": {"fleetdispatch"},
+		"action":    {"sendDiscoveryFleet"},
 	}
 
-	assert.False(t, isSessionRedirectStatus(http.StatusNotModified))
-	assert.False(t, isSessionRedirectStatus(http.StatusOK))
+	assert.True(t, isNormalDiscoveryRedirect(
+		http.MethodPost,
+		vals,
+		http.StatusFound,
+		serverURL+"/game/index.php?page=ingame&component=overview&displayError=1",
+		serverURL,
+	))
+	assert.False(t, isNormalDiscoveryRedirect(
+		http.MethodPost,
+		vals,
+		http.StatusFound,
+		"https://lobby.gameforge.com/login",
+		serverURL,
+	))
+	assert.False(t, isNormalDiscoveryRedirect(
+		http.MethodPost,
+		url.Values{"page": {"ingame"}, "component": {"fleetdispatch"}, "action": {"sendFleet"}},
+		http.StatusFound,
+		serverURL+"/game/index.php?page=ingame&component=overview",
+		serverURL,
+	))
+}
+
+func TestPostPageContentDoesNotTreatDiscoveryRedirectAsLogout(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.Redirect(w, r, "/game/index.php?page=ingame&component=overview&displayError=1", http.StatusFound)
+	}))
+	defer server.Close()
+
+	testDevice, err := device.NewBuilder("redirect-http-test").
+		SetTimezone("America/Los_Angeles").
+		SetOsName(device.Windows).
+		SetBrowserName(device.Chrome).
+		SetMemory(8).
+		SetHardwareConcurrency(4).
+		ScreenColorDepth(24).
+		SetScreenWidth(1920).
+		SetScreenHeight(1080).
+		Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bot, err := NewNoLogin(testDevice, "", "", "", "en")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bot.cache.serverURL = server.URL
+	bot.isLoggedInAtom.Store(true)
+	bot.isConnectedAtom.Store(true)
+	var logs bytes.Buffer
+	bot.SetLogger(log.New(&logs, "", 0))
+
+	_, err = bot.postPageContent(url.Values{
+		"page":      {"ingame"},
+		"component": {"fleetdispatch"},
+		"action":    {"sendDiscoveryFleet"},
+		"ajax":      {"1"},
+		"asJson":    {"1"},
+	}, url.Values{"token": {"test-token"}}, SkipRetry)
+	var redirectErr *requestRedirectError
+	assert.ErrorAs(t, err, &redirectErr)
+	assert.True(t, redirectErr.normal)
+	assert.False(t, errors.Is(err, ogame.ErrNotLogged))
+	assert.Equal(t, 1, requests)
+	assert.NotContains(t, logs.String(), "302")
+}
+
+func TestDiscoveryFleetSnapshotIgnoresOtherRoutes(t *testing.T) {
+	origin := ogame.Coordinate{Galaxy: 1, System: 2, Position: 3, Type: ogame.PlanetType}
+	destination := ogame.Coordinate{Galaxy: 1, System: 5, Position: 7, Type: ogame.PlanetType}
+	fleets := []ogame.Fleet{
+		{ID: 10, Mission: ogame.SearchForLifeforms, Origin: origin, Destination: destination},
+		{ID: 25, Mission: ogame.SearchForLifeforms, Origin: origin, Destination: ogame.Coordinate{Galaxy: 1, System: 6, Position: 7, Type: ogame.PlanetType}},
+		{ID: 40, Mission: ogame.Attack, Origin: origin, Destination: destination},
+	}
+	ids := discoveryFleetIDs(fleets, origin, destination)
+	assert.Contains(t, ids, ogame.FleetID(10))
+	assert.NotContains(t, ids, ogame.FleetID(25))
+	assert.NotContains(t, ids, ogame.FleetID(40))
+}
+
+func TestInternalRedirectIsNotRetriedAsAStateChangingAction(t *testing.T) {
+	redirectErr := &requestRedirectError{
+		statusCode: http.StatusFound,
+		location:   "/game/index.php?page=ingame&component=overview&displayError=1",
+	}
+	assert.ErrorIs(t, redirectErr, ErrActionRedirect)
+
+	b, err := NewNoLogin(&device.Device{}, "", "", "", "")
+	assert.NoError(t, err)
+	b.isLoggedInAtom.Store(true)
+	calls := 0
+	err = b.withRetry(func() error {
+		calls++
+		return redirectErr
+	})
+	assert.ErrorIs(t, err, ErrActionRedirect)
+	assert.Equal(t, 1, calls)
+}
+
+func TestDiscoveryActionPrefersTheCurrentAjaxToken(t *testing.T) {
+	assert.Equal(t, "current-token", discoveryActionToken("current-token", "page-token"))
+	assert.Equal(t, "page-token", discoveryActionToken("", "page-token"))
 }
 
 func TestServerErrorsArePropagatedToTheRetryLayer(t *testing.T) {
