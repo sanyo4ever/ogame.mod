@@ -4573,11 +4573,11 @@ func (b *OGame) getTasks() (out taskRunner.TasksOverview) {
 	return b.taskRunnerInst.GetTasks()
 }
 
-func discoveryActionToken(currentToken, pageToken string) string {
-	if token := strings.TrimSpace(currentToken); token != "" {
-		return token
+func discoveryPageToken(pageToken string) (string, error) {
+	if token := strings.TrimSpace(pageToken); token != "" {
+		return token, nil
 	}
-	return pageToken
+	return "", errors.New("discovery page did not contain an action token")
 }
 
 func (b *OGame) sendDiscoveryFleet(celestialID ogame.CelestialID, coord ogame.Coordinate, options ...Option) error {
@@ -4585,6 +4585,10 @@ func (b *OGame) sendDiscoveryFleet(celestialID ogame.CelestialID, coord ogame.Co
 	// Check if the sendDiscoveryFleet button is available for the target.
 	// This checks for the envoys technology, if the planet has enough resources, if there's fleet slots available and if there's no cooldown on the position.
 	galaxyPage, err := b.getGalaxyPage(coord.Galaxy, coord.System, options...)
+	if err != nil {
+		return err
+	}
+	actionToken, err := discoveryPageToken(galaxyPage.Token)
 	if err != nil {
 		return err
 	}
@@ -4631,7 +4635,9 @@ func (b *OGame) sendDiscoveryFleet(celestialID ogame.CelestialID, coord ogame.Co
 		"galaxy":   {utils.FI64(coord.Galaxy)},
 		"system":   {utils.FI64(coord.System)},
 		"position": {utils.FI64(coord.Position)},
-		"token":    {discoveryActionToken(b.cache.token, galaxyPage.Token)},
+		// This token belongs to the system page loaded immediately above.
+		// The shared cache token may be replaced by another worker meanwhile.
+		"token": {actionToken},
 	}, sendOptions...)
 	if err != nil {
 		var redirectErr *requestRedirectError
@@ -4750,6 +4756,10 @@ func (b *OGame) sendSystemDiscoveryFleet(celestialID ogame.CelestialID, galaxy, 
 	if err != nil {
 		return nil, err
 	}
+	actionToken, err := discoveryPageToken(galaxyPage.Token)
+	if err != nil {
+		return nil, err
+	}
 	if _, ok := galaxyPage.System.CanSendSystemDiscovery.(string); ok {
 		return nil, errors.New("can't send system discovery")
 	}
@@ -4762,7 +4772,7 @@ func (b *OGame) sendSystemDiscoveryFleet(celestialID ogame.CelestialID, galaxy, 
 	}, url.Values{
 		"galaxy": {utils.FI64(galaxy)},
 		"system": {utils.FI64(system)},
-		"token":  {discoveryActionToken(b.cache.token, galaxyPage.Token)},
+		"token":  {actionToken},
 	})
 	if err != nil {
 		return nil, err

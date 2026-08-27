@@ -302,9 +302,18 @@ func TestInternalRedirectIsNotRetriedAsAStateChangingAction(t *testing.T) {
 	assert.Equal(t, 1, calls)
 }
 
-func TestDiscoveryActionPrefersTheCurrentAjaxToken(t *testing.T) {
-	assert.Equal(t, "current-token", discoveryActionToken("current-token", "page-token"))
-	assert.Equal(t, "page-token", discoveryActionToken("", "page-token"))
+func TestDiscoveryActionUsesTheSystemPageToken(t *testing.T) {
+	token, err := discoveryPageToken("page-token")
+	assert.NoError(t, err)
+	assert.Equal(t, "page-token", token)
+
+	// A token written by another worker must not be part of this decision.
+	assert.NotEqual(t, "other-worker-token", token)
+}
+
+func TestDiscoveryActionRejectsMissingSystemPageToken(t *testing.T) {
+	_, err := discoveryPageToken(" ")
+	assert.EqualError(t, err, "discovery page did not contain an action token")
 }
 
 func TestServerErrorsArePropagatedToTheRetryLayer(t *testing.T) {
