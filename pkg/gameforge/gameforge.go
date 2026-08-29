@@ -252,7 +252,7 @@ func New(config *Config) (*Gameforge, error) {
 // If no "solver" have been set or "maxCaptchaRetries" is 0, then it will not try to solve the captcha
 func (g *Gameforge) Login(params *LoginParams) (out *LoginResponse, err error) {
 	err = g.handleCaptcha(func(challengeID string) error {
-		if params.ChallengeID == "" || challengeID != "" {
+		if challengeID != "" {
 			params.ChallengeID = challengeID
 		}
 		params.PowNonces = g.powNonces
@@ -872,6 +872,10 @@ func postSessionsReq(params *loginParams, gameEnvironmentID, platformGameID stri
 }
 
 func StartChallenge(ctx context.Context, client HttpClient, challengeID string) (questionRaw, iconsRaw []byte, err error) {
+	if strings.TrimSpace(challengeID) == "" {
+		return nil, nil, errors.New("captcha challenge id is required")
+	}
+
 	doReq := func(u string) ([]byte, error) {
 		req, err := http.NewRequest(http.MethodGet, u, nil)
 		if err != nil {
@@ -887,6 +891,9 @@ func StartChallenge(ctx context.Context, client HttpClient, challengeID string) 
 		raw, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return nil, err
+		}
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			return nil, fmt.Errorf("captcha endpoint returned %s", resp.Status)
 		}
 		return raw, nil
 	}
@@ -908,9 +915,18 @@ func StartChallenge(ctx context.Context, client HttpClient, challengeID string) 
 }
 
 func SolveChallenge(ctx context.Context, client HttpClient, challengeID string, answer int64) error {
+	if strings.TrimSpace(challengeID) == "" {
+		return errors.New("captcha challenge id is required")
+	}
+	if answer < 0 || answer > 3 {
+		return fmt.Errorf("captcha answer must be between 0 and 3, got %d", answer)
+	}
 	challengeURL := getChallengeURL(imgDropChallengeBaseURL, challengeID) + "/" + endpointLoc
 	body := strings.NewReader(fmt.Sprintf(`{"answer":%d}`, answer))
-	req, _ := http.NewRequest(http.MethodPost, challengeURL, body)
+	req, err := http.NewRequest(http.MethodPost, challengeURL, body)
+	if err != nil {
+		return err
+	}
 	req.Header.Set(contentTypeHeaderKey, applicationJson)
 	req.Header.Set(acceptEncodingHeaderKey, gzipEncoding)
 	req = req.WithContext(ctx)

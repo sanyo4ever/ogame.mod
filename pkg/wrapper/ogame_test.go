@@ -172,24 +172,34 @@ func TestExtractMessagesPageOnlyExtractsTheRequestedPage(t *testing.T) {
 
 func TestRedirectClassificationUsesTheRedirectTarget(t *testing.T) {
 	serverURL := "https://s176-pt.ogame.gameforge.com"
+	actionURL := serverURL + "/game/index.php?page=ingame&component=fleetdispatch"
 
 	assert.False(t, isSessionRedirect(
 		http.StatusFound,
 		serverURL+"/game/index.php?page=ingame&component=overview&displayError=1",
+		actionURL,
 		serverURL,
 	))
 	assert.True(t, isSessionRedirect(
 		http.StatusFound,
 		"https://lobby.gameforge.com/login",
+		actionURL,
 		serverURL,
 	))
 	assert.True(t, isSessionRedirect(
 		http.StatusFound,
 		serverURL+"/game/index.php?page=login",
+		actionURL,
 		serverURL,
 	))
-	assert.True(t, isSessionRedirect(http.StatusFound, "", serverURL))
-	assert.False(t, isSessionRedirect(http.StatusOK, "", serverURL))
+	assert.False(t, isSessionRedirect(
+		http.StatusFound,
+		"?page=ingame&component=overview",
+		actionURL,
+		serverURL,
+	))
+	assert.True(t, isSessionRedirect(http.StatusFound, "", actionURL, serverURL))
+	assert.False(t, isSessionRedirect(http.StatusOK, "", actionURL, serverURL))
 }
 
 func TestDiscoveryRedirectIsClassifiedAsNormalInternalAction(t *testing.T) {
@@ -205,6 +215,27 @@ func TestDiscoveryRedirectIsClassifiedAsNormalInternalAction(t *testing.T) {
 		vals,
 		http.StatusFound,
 		serverURL+"/game/index.php?page=ingame&component=overview&displayError=1",
+		serverURL,
+	))
+	assert.True(t, isNormalDiscoveryRedirect(
+		http.MethodPost,
+		vals,
+		http.StatusFound,
+		"?page=ingame&component=overview",
+		serverURL,
+	))
+	assert.True(t, isNormalDiscoveryRedirect(
+		http.MethodPost,
+		vals,
+		http.StatusFound,
+		serverURL+"/game/index.php?page=componentOnly&component=fleetdispatch",
+		serverURL,
+	))
+	assert.True(t, isNormalDiscoveryRedirect(
+		http.MethodPost,
+		vals,
+		http.StatusFound,
+		serverURL+"/game/index.php",
 		serverURL,
 	))
 	assert.False(t, isNormalDiscoveryRedirect(
@@ -266,7 +297,7 @@ func TestPostPageContentDoesNotTreatDiscoveryRedirectAsLogout(t *testing.T) {
 	assert.True(t, redirectErr.normal)
 	assert.False(t, errors.Is(err, ogame.ErrNotLogged))
 	assert.Equal(t, 1, requests)
-	assert.NotContains(t, logs.String(), "302")
+	assert.NotContains(t, logs.String(), "bad status")
 }
 
 func TestDiscoveryFleetSnapshotIgnoresOtherRoutes(t *testing.T) {
@@ -281,6 +312,35 @@ func TestDiscoveryFleetSnapshotIgnoresOtherRoutes(t *testing.T) {
 	assert.Contains(t, ids, ogame.FleetID(10))
 	assert.NotContains(t, ids, ogame.FleetID(25))
 	assert.NotContains(t, ids, ogame.FleetID(40))
+}
+
+func TestDiscoverySystemViewOnlyReturnsAvailableLifeformMissions(t *testing.T) {
+	page := &GalaxyPageContent{}
+	page.System.GalaxyContent = []GalaxyPositionContent{
+		{
+			Position: 3,
+			AvailableMissions: []GalaxyMissionContent{
+				{MissionType: ogame.Expedition, CanSend: true},
+			},
+		},
+		{
+			Position: 4,
+			AvailableMissions: []GalaxyMissionContent{
+				{MissionType: ogame.SearchForLifeforms, CanSend: false},
+			},
+		},
+		{
+			Position: 5,
+			AvailableMissions: []GalaxyMissionContent{
+				{MissionType: ogame.SearchForLifeforms, CanSend: true},
+			},
+		},
+	}
+
+	positions := availableDiscoveryPositions(page, 1, 10)
+	assert.Equal(t, []ogame.Coordinate{
+		{Galaxy: 1, System: 10, Position: 5, Type: ogame.PlanetType},
+	}, positions)
 }
 
 func TestInternalRedirectIsNotRetriedAsAStateChangingAction(t *testing.T) {
@@ -314,6 +374,19 @@ func TestDiscoveryActionUsesTheSystemPageToken(t *testing.T) {
 func TestDiscoveryActionRejectsMissingSystemPageToken(t *testing.T) {
 	_, err := discoveryPageToken(" ")
 	assert.EqualError(t, err, "discovery page did not contain an action token")
+}
+
+func TestDiscoveryResponseParsesTopLevelV13BusyError(t *testing.T) {
+	err := parseDiscoveryActionResponse([]byte(`{"status":"failure","success":false,"errors":[{"message":"busy","error":100}],"error":{"message":"busy","error":100}}`))
+	var pendingErr *discoveryRequestPendingError
+	assert.ErrorAs(t, err, &pendingErr)
+	assert.ErrorIs(t, err, errDiscoveryRequestPending)
+	assert.Contains(t, err.Error(), "code 100")
+}
+
+func TestDiscoveryResponseParsesNestedSuccess(t *testing.T) {
+	err := parseDiscoveryActionResponse([]byte(`{"response":{"success":true}}`))
+	assert.NoError(t, err)
 }
 
 func TestServerErrorsArePropagatedToTheRetryLayer(t *testing.T) {

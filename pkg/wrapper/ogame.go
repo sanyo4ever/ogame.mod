@@ -82,7 +82,11 @@ type OGame struct {
 	extractor            extractor.Extractor
 	apiNewHostname       string
 	captchaCallback      gameforge.CaptchaSolver
+	captchaChallengeMu   sync.Mutex
+	captchaChallengeID   string
+	solvedCaptchaID      string
 	device               *device.Device
+	discoveryDispatchMu  sync.Mutex
 	cache                struct {
 		serverData            ServerData
 		location              *time.Location
@@ -332,18 +336,23 @@ func (b *OGame) introBypass(page *parser.OverviewPage) error {
 func postSessions(b *OGame) (bearerToken string, err error) {
 	b.debug("post sessions")
 	client := b.device.GetClient()
+	challengeID := b.takeSolvedCaptcha()
 	if err := client.WithTransport(b.loginProxyTransport, func(client *httpclient.Client) error {
-		gf, _ := gameforge.New(&gameforge.Config{
+		gf, err := gameforge.New(&gameforge.Config{
 			Ctx:      b.ctx,
 			Device:   b.device,
 			Platform: PLATFORM,
 			Lobby:    b.lobby,
 			Solver:   b.captchaCallback,
 		})
+		if err != nil {
+			return err
+		}
 		res, err := gf.Login(&gameforge.LoginParams{
-			Username:  b.username,
-			Password:  b.password,
-			OtpSecret: b.otpSecret,
+			Username:    b.username,
+			Password:    b.password,
+			OtpSecret:   b.otpSecret,
+			ChallengeID: challengeID,
 		})
 		if err != nil {
 			return err
@@ -911,7 +920,31 @@ func isRedirectStatus(statusCode int) bool {
 // internal redirects OGame sends after some successful actions. OGame v13's
 // discovery action can return 302 to another in-game page after creating the
 // fleet, so status alone is not evidence that the session expired.
-func isSessionRedirect(statusCode int, location, serverURL string) bool {
+func resolveRedirectTarget(location, referenceURL, serverURL string) (*url.URL, error) {
+	if strings.TrimSpace(location) == "" {
+		return nil, errors.New("redirect has no location")
+	}
+
+	server, err := url.Parse(serverURL)
+	if err != nil || server.Scheme == "" || server.Host == "" {
+		return nil, errors.New("invalid server URL")
+	}
+	reference, err := url.Parse(referenceURL)
+	if err != nil || reference.Scheme == "" || reference.Host == "" {
+		return nil, errors.New("invalid request URL")
+	}
+	target, err := url.Parse(location)
+	if err != nil {
+		return nil, err
+	}
+	target = reference.ResolveReference(target)
+	if !strings.EqualFold(target.Scheme, server.Scheme) || !strings.EqualFold(target.Host, server.Host) {
+		return nil, errors.New("redirect leaves the game server")
+	}
+	return target, nil
+}
+
+func isSessionRedirect(statusCode int, location, referenceURL, serverURL string) bool {
 	if !isRedirectStatus(statusCode) {
 		return false
 	}
@@ -919,16 +952,8 @@ func isSessionRedirect(statusCode int, location, serverURL string) bool {
 		return true
 	}
 
-	base, err := url.Parse(serverURL)
-	if err != nil || base.Scheme == "" || base.Host == "" {
-		return true
-	}
-	target, err := url.Parse(location)
+	target, err := resolveRedirectTarget(location, referenceURL, serverURL)
 	if err != nil {
-		return true
-	}
-	target = base.ResolveReference(target)
-	if !strings.EqualFold(target.Scheme, base.Scheme) || !strings.EqualFold(target.Host, base.Host) {
 		return true
 	}
 
@@ -950,22 +975,31 @@ func isNormalDiscoveryRedirect(method string, vals url.Values, statusCode int, l
 		vals.Get("component") != "fleetdispatch" || vals.Get("action") != "sendDiscoveryFleet" {
 		return false
 	}
-	if !isRedirectStatus(statusCode) || isSessionRedirect(statusCode, location, serverURL) {
+	actionURL := strings.TrimRight(serverURL, "/") + "/game/index.php"
+	if !isRedirectStatus(statusCode) {
 		return false
 	}
 
-	target, err := url.Parse(location)
+	target, err := resolveRedirectTarget(location, actionURL, serverURL)
 	if err != nil {
 		return false
 	}
-	base, err := url.Parse(serverURL)
-	if err != nil {
+	if !strings.EqualFold(strings.TrimSuffix(target.Path, "/"), "/game/index.php") {
 		return false
 	}
-	target = base.ResolveReference(target)
-	query := target.Query()
-	return strings.EqualFold(strings.TrimSuffix(target.Path, "/"), "/game/index.php") &&
-		strings.EqualFold(strings.TrimSpace(query.Get("page")), "ingame")
+
+	// OGame has used both `page=ingame` and `page=componentOnly` for the
+	// internal destination of this AJAX action. A successful action can also
+	// redirect to index.php without a page query. The fleet reconciliation in
+	// sendDiscoveryFleet is the final proof that the state-changing operation
+	// was applied; this function only proves that the redirect stayed inside
+	// the current game session.
+	switch strings.ToLower(strings.TrimSpace(target.Query().Get("page"))) {
+	case "login", "lobbylogin", "logout":
+		return false
+	default:
+		return true
+	}
 }
 
 func (b *OGame) execRequest(method, finalURL string, payload, vals url.Values) ([]byte, requestResponse, error) {
@@ -1008,7 +1042,7 @@ func (b *OGame) execRequest(method, finalURL string, payload, vals url.Values) (
 		location:   resp.Header.Get("Location"),
 	}
 	if resp.StatusCode != http.StatusOK &&
-		!(isRedirectStatus(resp.StatusCode) && !isSessionRedirect(resp.StatusCode, response.location, b.cache.serverURL)) {
+		!(isRedirectStatus(resp.StatusCode) && !isSessionRedirect(resp.StatusCode, response.location, finalURL, b.cache.serverURL)) {
 		b.error("bad status | vals:" + vals.Encode() + " | " + resp.Status)
 	}
 
@@ -1136,7 +1170,7 @@ func (b *OGame) pageContent(method string, vals, payload url.Values, opts ...Opt
 		}
 
 		if isRedirectStatus(response.statusCode) {
-			if isSessionRedirect(response.statusCode, response.location, b.cache.serverURL) {
+			if isSessionRedirect(response.statusCode, response.location, finalURL, b.cache.serverURL) {
 				b.error("Err not logged on redirect from page : ", page)
 				saveNotLoggedHTML(page, pageHTMLBytes)
 				b.isConnectedAtom.Store(false)
@@ -1390,6 +1424,53 @@ func (b *OGame) setOGameCredentials(username, password, otpSecret, bearerToken s
 	b.password = password
 	b.otpSecret = otpSecret
 	b.bearerToken = bearerToken
+}
+
+func (b *OGame) rememberCaptchaChallenge(challengeID string) {
+	if challengeID == "" {
+		return
+	}
+	b.captchaChallengeMu.Lock()
+	b.captchaChallengeID = challengeID
+	b.solvedCaptchaID = ""
+	b.captchaChallengeMu.Unlock()
+}
+
+func (b *OGame) pendingCaptchaChallenge() string {
+	b.captchaChallengeMu.Lock()
+	defer b.captchaChallengeMu.Unlock()
+	return b.captchaChallengeID
+}
+
+func (b *OGame) forgetCaptchaChallenge(challengeID string) {
+	b.captchaChallengeMu.Lock()
+	if challengeID == "" || b.captchaChallengeID == challengeID {
+		b.captchaChallengeID = ""
+	}
+	b.captchaChallengeMu.Unlock()
+}
+
+func (b *OGame) rememberSolvedCaptcha(challengeID string) {
+	if challengeID == "" {
+		return
+	}
+	b.captchaChallengeMu.Lock()
+	b.solvedCaptchaID = challengeID
+	b.captchaChallengeMu.Unlock()
+}
+
+func (b *OGame) hasSolvedCaptcha() bool {
+	b.captchaChallengeMu.Lock()
+	defer b.captchaChallengeMu.Unlock()
+	return b.solvedCaptchaID != ""
+}
+
+func (b *OGame) takeSolvedCaptcha() string {
+	b.captchaChallengeMu.Lock()
+	defer b.captchaChallengeMu.Unlock()
+	challengeID := b.solvedCaptchaID
+	b.solvedCaptchaID = ""
+	return challengeID
 }
 
 func (b *OGame) enable() {
@@ -4580,7 +4661,123 @@ func discoveryPageToken(pageToken string) (string, error) {
 	return "", errors.New("discovery page did not contain an action token")
 }
 
+var errDiscoveryRequestPending = errors.New("OGame is still processing the previous discovery request")
+
+type discoveryRequestPendingError struct {
+	message string
+	code    int
+}
+
+func (e *discoveryRequestPendingError) Error() string {
+	if e.message == "" {
+		return errDiscoveryRequestPending.Error()
+	}
+	return fmt.Sprintf("%s (code %d)", e.message, e.code)
+}
+
+func (e *discoveryRequestPendingError) Unwrap() error {
+	return errDiscoveryRequestPending
+}
+
+type discoveryActionError struct {
+	message string
+	code    int
+}
+
+func (e *discoveryActionError) Error() string {
+	if e.code == 0 {
+		return e.message
+	}
+	return fmt.Sprintf("%s (code %d)", e.message, e.code)
+}
+
+type discoveryActionResponse struct {
+	Success  *bool                          `json:"success"`
+	Message  string                         `json:"message"`
+	Errors   []discoveryActionResponseError `json:"errors"`
+	Error    *discoveryActionResponseError  `json:"error"`
+	Response *struct {
+		Success *bool                          `json:"success"`
+		Message string                         `json:"message"`
+		Errors  []discoveryActionResponseError `json:"errors"`
+		Error   *discoveryActionResponseError  `json:"error"`
+	} `json:"response"`
+}
+
+type discoveryActionResponseError struct {
+	Message string `json:"message"`
+	Code    int    `json:"error"`
+}
+
+func parseDiscoveryActionResponse(body []byte) error {
+	var payload discoveryActionResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return errors.New("failed to unmarshal response: " + err.Error())
+	}
+
+	success := payload.Success
+	message := strings.TrimSpace(payload.Message)
+	errorsList := payload.Errors
+	responseError := payload.Error
+	if payload.Response != nil {
+		success = payload.Response.Success
+		if message == "" {
+			message = strings.TrimSpace(payload.Response.Message)
+		}
+		if len(errorsList) == 0 {
+			errorsList = payload.Response.Errors
+		}
+		if responseError == nil {
+			responseError = payload.Response.Error
+		}
+	}
+
+	if success == nil {
+		return errors.New("OGame returned a discovery response without a success field")
+	}
+	if *success {
+		return nil
+	}
+
+	code := 0
+	if responseError != nil {
+		if message == "" {
+			message = strings.TrimSpace(responseError.Message)
+		}
+		code = responseError.Code
+	}
+	if message == "" {
+		for _, responseErr := range errorsList {
+			if strings.TrimSpace(responseErr.Message) == "" {
+				continue
+			}
+			message = strings.TrimSpace(responseErr.Message)
+			if code == 0 {
+				code = responseErr.Code
+			}
+			break
+		}
+	}
+	if message == "" {
+		message = "OGame rejected the discovery fleet request without an error message"
+	}
+	if code == 100 {
+		return &discoveryRequestPendingError{message: message, code: code}
+	}
+	return &discoveryActionError{message: message, code: code}
+}
+
 func (b *OGame) sendDiscoveryFleet(celestialID ogame.CelestialID, coord ogame.Coordinate, options ...Option) error {
+	b.discoveryDispatchMu.Lock()
+	defer b.discoveryDispatchMu.Unlock()
+
+	// A discovery POST changes game state. Never replay it automatically after
+	// an application-level rejection: the server may still be completing the
+	// previous request and a blind retry can create a duplicate fleet.
+	return b.sendDiscoveryFleetAttempt(celestialID, coord, options...)
+}
+
+func (b *OGame) sendDiscoveryFleetAttempt(celestialID ogame.CelestialID, coord ogame.Coordinate, options ...Option) error {
 	options = append(options, ChangePlanet(celestialID))
 	// Check if the sendDiscoveryFleet button is available for the target.
 	// This checks for the envoys technology, if the planet has enough resources, if there's fleet slots available and if there's no cooldown on the position.
@@ -4592,21 +4789,35 @@ func (b *OGame) sendDiscoveryFleet(celestialID ogame.CelestialID, coord ogame.Co
 	if err != nil {
 		return err
 	}
+	targetFound := false
+	discoveryAvailable := false
 	for _, position := range galaxyPage.System.GalaxyContent {
-		if position.Position == coord.Position {
-			for _, availableMission := range position.AvailableMissions {
-				if availableMission.MissionType == ogame.SearchForLifeforms {
-					errMsg := "can't send discovery mission"
-					if canSend, ok := availableMission.CanSend.(bool); ok {
-						if !canSend {
-							return errors.New(errMsg)
-						}
-					} else if canSendStr, ok := availableMission.CanSend.(string); ok {
-						return errors.New(errMsg + ": " + canSendStr)
-					}
+		if position.Position != coord.Position {
+			continue
+		}
+		targetFound = true
+		for _, availableMission := range position.AvailableMissions {
+			if availableMission.MissionType != ogame.SearchForLifeforms {
+				continue
+			}
+
+			errMsg := "can't send discovery mission"
+			if canSend, ok := availableMission.CanSend.(bool); ok {
+				if !canSend {
+					return errors.New(errMsg)
 				}
+				discoveryAvailable = true
+			} else if canSendStr, ok := availableMission.CanSend.(string); ok {
+				return errors.New(errMsg + ": " + canSendStr)
 			}
 		}
+		break
+	}
+	if !targetFound {
+		return errors.New("discovery target is not present in the system view")
+	}
+	if !discoveryAvailable {
+		return errors.New("discovery mission is not available for the target")
 	}
 
 	// Keep a fleet watermark before the state-changing request. If OGame
@@ -4649,19 +4860,17 @@ func (b *OGame) sendDiscoveryFleet(celestialID ogame.CelestialID, coord ogame.Co
 		return err
 	}
 
-	var resStruct struct {
-		Response struct {
-			Success bool   `json:"success"`
-			Message string `json:"message"`
-		} `json:"response"`
-		Components   []any  `json:"components"`
-		NewAjaxToken string `json:"newAjaxToken"`
-	}
-	if err := json.Unmarshal(res, &resStruct); err != nil {
-		return errors.New("failed to unmarshal response: " + err.Error())
-	}
-	if !resStruct.Response.Success {
-		return errors.New(resStruct.Response.Message)
+	if err := parseDiscoveryActionResponse(res); err != nil {
+		var pendingErr *discoveryRequestPendingError
+		if errors.As(err, &pendingErr) {
+			// Code 100 explicitly means that OGame has not finished processing
+			// the previous request. Reconcile first so a delayed successful
+			// dispatch is never duplicated by the bounded retry.
+			if confirmErr := b.confirmDiscoveryFleetDispatched(celestialID, coord, initialFleetIDs); confirmErr == nil {
+				return nil
+			}
+		}
+		return err
 	}
 	return nil
 }
@@ -4825,16 +5034,20 @@ func (b *OGame) getAvailableDiscoveries(opts ...Option) (int64, error) {
 
 type GalaxyPageContent struct {
 	System struct {
-		CanSendSystemDiscovery any `json:"canSendSystemDiscovery"`
-		GalaxyContent          []struct {
-			Position          int64 `json:"position"`
-			AvailableMissions []struct {
-				CanSend     any             `json:"canSend,omitempty"`
-				MissionType ogame.MissionID `json:"missionType,omitempty"`
-			} `json:"availableMissions"`
-		} `json:"galaxyContent"`
+		CanSendSystemDiscovery any                     `json:"canSendSystemDiscovery"`
+		GalaxyContent          []GalaxyPositionContent `json:"galaxyContent"`
 	} `json:"system"`
 	Token string `json:"token"`
+}
+
+type GalaxyPositionContent struct {
+	Position          int64                  `json:"position"`
+	AvailableMissions []GalaxyMissionContent `json:"availableMissions"`
+}
+
+type GalaxyMissionContent struct {
+	CanSend     any             `json:"canSend,omitempty"`
+	MissionType ogame.MissionID `json:"missionType,omitempty"`
 }
 
 func (b *OGame) getPositionsAvailableForDiscoveryFleet(galaxy int64, system int64, opts ...Option) ([]ogame.Coordinate, error) {
@@ -4843,17 +5056,26 @@ func (b *OGame) getPositionsAvailableForDiscoveryFleet(galaxy int64, system int6
 		return nil, err
 	}
 
-	// Loop through all AvailableMissions in all positions, add those positions that are available.
+	return availableDiscoveryPositions(galaxyPage, galaxy, system), nil
+}
+
+func availableDiscoveryPositions(galaxyPage *GalaxyPageContent, galaxy, system int64) []ogame.Coordinate {
+	// Only a position with an available lifeform-discovery mission is eligible.
+	// Other missions can be present in the same system response and must not make
+	// the AutoDiscovery worker submit an invalid discovery request.
 	availablePositions := make([]ogame.Coordinate, 0)
+	if galaxyPage == nil {
+		return availablePositions
+	}
 	for _, position := range galaxyPage.System.GalaxyContent {
 		for _, availableMission := range position.AvailableMissions {
-			if availableMission.CanSend == true {
+			if availableMission.MissionType == ogame.SearchForLifeforms && availableMission.CanSend == true {
 				availablePositions = append(availablePositions, ogame.Coordinate{Galaxy: galaxy, System: system, Position: position.Position, Type: ogame.PlanetType})
 			}
 		}
 	}
 
-	return availablePositions, nil
+	return availablePositions
 }
 
 func (b *OGame) getChapter(chapterID int64) (ogame.Chapter, error) {

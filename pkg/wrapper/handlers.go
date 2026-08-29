@@ -97,11 +97,17 @@ func PageContentHandler(c echo.Context) error {
 func LoginHandler(c echo.Context) error {
 	bot := c.Get("bot").(*OGame)
 	if _, _, err := bot.LoginWithExistingCookies(); err != nil {
+		var captchaErr *gameforge.CaptchaRequiredError
+		if errors.As(err, &captchaErr) {
+			bot.rememberCaptchaChallenge(captchaErr.ChallengeID)
+			return c.JSON(http.StatusConflict, ErrorResp(http.StatusConflict, err.Error()))
+		}
 		if err == gameforge.ErrBadCredentials {
 			return c.JSON(http.StatusBadRequest, ErrorResp(400, err.Error()))
 		}
 		return c.JSON(http.StatusInternalServerError, ErrorResp(500, err.Error()))
 	}
+	bot.forgetCaptchaChallenge("")
 	return c.JSON(http.StatusOK, SuccessResp(nil))
 }
 
@@ -1642,34 +1648,22 @@ func TechsHandler(c echo.Context) error {
 // GetCaptchaHandler ...
 func GetCaptchaHandler(c echo.Context) error {
 	bot := c.Get("bot").(*OGame)
-	gf, _ := gameforge.New(&gameforge.Config{Ctx: bot.ctx, Device: bot.device, Platform: PLATFORM, Lobby: bot.lobby})
-	_, err := gf.Login(&gameforge.LoginParams{
-		Username:  bot.username,
-		Password:  bot.password,
-		OtpSecret: bot.otpSecret,
-	})
-	var captchaErr *gameforge.CaptchaRequiredError
-	if errors.As(err, &captchaErr) {
-		questionRaw, iconsRaw, err := gameforge.StartChallenge(bot.ctx, bot.GetClient(), captchaErr.ChallengeID)
-		if err != nil {
-			return c.HTML(http.StatusOK, err.Error())
-		}
-
-		questionB64 := base64.StdEncoding.EncodeToString(questionRaw)
-		iconsB64 := base64.StdEncoding.EncodeToString(iconsRaw)
-
-		html := `<img style="background-color: black;" src="data:image/png;base64,` + questionB64 + `" /><br />
-<img style="background-color: black;" src="data:image/png;base64,` + iconsB64 + `" /><br />
-<form action="/bot/captcha/solve" method="POST">
-	<input type="hidden" name="challenge_id" value="` + captchaErr.ChallengeID + `" />
-	Enter 0,1,2 or 3 and press Enter <input type="number" name="answer" />
-</form>` + captchaErr.ChallengeID
-
-		return c.HTML(http.StatusOK, html)
-	} else if err != nil {
-		return c.HTML(http.StatusOK, err.Error())
+	challenge, err := getCaptchaChallenge(bot)
+	if err != nil {
+		return c.HTML(http.StatusInternalServerError, err.Error())
 	}
-	return c.HTML(http.StatusOK, "no captcha found")
+	if challenge.ID == "" {
+		return c.HTML(http.StatusOK, "no captcha found")
+	}
+
+	html := `<img style="background-color: black;" src="data:image/png;base64,` + challenge.Question + `" /><br />
+<img style="background-color: black;" src="data:image/png;base64,` + challenge.Icons + `" /><br />
+<form action="/bot/captcha/solve" method="POST">
+	<input type="hidden" name="challenge_id" value="` + challenge.ID + `" />
+	Enter 0,1,2 or 3 and press Enter <input type="number" name="answer" />
+</form>` + challenge.ID
+
+	return c.HTML(http.StatusOK, html)
 }
 
 // GetCaptchaSolverHandler ...
@@ -1677,16 +1671,33 @@ func GetCaptchaSolverHandler(c echo.Context) error {
 	bot := c.Get("bot").(*OGame)
 	challengeID := c.Request().PostFormValue("challenge_id")
 	answer := utils.DoParseI64(c.Request().PostFormValue("answer"))
+	if challengeID == "" {
+		return c.JSON(http.StatusBadRequest, ErrorResp(http.StatusBadRequest, "captcha challenge id is required"))
+	}
+	if answer < 0 || answer > 3 {
+		return c.JSON(http.StatusBadRequest, ErrorResp(http.StatusBadRequest, "captcha answer must be between 0 and 3"))
+	}
 
 	if err := gameforge.SolveChallenge(bot.ctx, bot.GetClient(), challengeID, answer); err != nil {
 		bot.error(err)
+		return c.JSON(http.StatusBadGateway, ErrorResp(http.StatusBadGateway, err.Error()))
 	}
 
 	if !bot.IsLoggedIn() {
+		// Gameforge requires the solved challenge id on the next login request.
+		// Keep it separate from the displayed challenge so postSessions can
+		// consume it exactly once.
+		bot.rememberSolvedCaptcha(challengeID)
 		if err := bot.Login(); err != nil {
 			bot.error(err)
+			var captchaErr *gameforge.CaptchaRequiredError
+			if errors.As(err, &captchaErr) {
+				bot.rememberCaptchaChallenge(captchaErr.ChallengeID)
+			}
+			return c.JSON(http.StatusInternalServerError, ErrorResp(http.StatusInternalServerError, err.Error()))
 		}
 	}
+	bot.forgetCaptchaChallenge(challengeID)
 	return c.JSON(http.StatusOK, SuccessResp(nil))
 }
 
@@ -1697,32 +1708,50 @@ type CaptchaChallenge struct {
 	Icons    string
 }
 
+func getCaptchaChallenge(bot *OGame) (CaptchaChallenge, error) {
+	challengeID := bot.pendingCaptchaChallenge()
+	if challengeID == "" {
+		gf, err := gameforge.New(&gameforge.Config{Ctx: bot.ctx, Device: bot.device, Platform: PLATFORM, Lobby: bot.lobby})
+		if err != nil {
+			return CaptchaChallenge{}, err
+		}
+		_, err = gf.Login(&gameforge.LoginParams{
+			Username:  bot.username,
+			Password:  bot.password,
+			OtpSecret: bot.otpSecret,
+		})
+		var captchaErr *gameforge.CaptchaRequiredError
+		if errors.As(err, &captchaErr) {
+			challengeID = captchaErr.ChallengeID
+			bot.rememberCaptchaChallenge(challengeID)
+		} else if err != nil {
+			return CaptchaChallenge{}, err
+		}
+	}
+
+	if challengeID == "" {
+		return CaptchaChallenge{}, nil
+	}
+	questionRaw, iconsRaw, err := gameforge.StartChallenge(bot.ctx, bot.GetClient(), challengeID)
+	if err != nil {
+		bot.forgetCaptchaChallenge(challengeID)
+		return CaptchaChallenge{}, err
+	}
+	return CaptchaChallenge{
+		ID:       challengeID,
+		Question: base64.StdEncoding.EncodeToString(questionRaw),
+		Icons:    base64.StdEncoding.EncodeToString(iconsRaw),
+	}, nil
+}
+
 // GetCaptchaChallengeHandler ...
 func GetCaptchaChallengeHandler(c echo.Context) error {
 	bot := c.Get("bot").(*OGame)
-	gf, _ := gameforge.New(&gameforge.Config{Ctx: bot.ctx, Device: bot.device, Platform: PLATFORM, Lobby: bot.lobby})
-	_, err := gf.Login(&gameforge.LoginParams{
-		Username:  bot.username,
-		Password:  bot.password,
-		OtpSecret: bot.otpSecret,
-	})
-	var captchaErr *gameforge.CaptchaRequiredError
-	if errors.As(err, &captchaErr) {
-		questionRaw, iconsRaw, err := gameforge.StartChallenge(bot.ctx, bot.GetClient(), captchaErr.ChallengeID)
-		if err != nil {
-			return c.JSON(http.StatusInternalServerError, ErrorResp(500, err.Error()))
-		}
-		questionB64 := base64.StdEncoding.EncodeToString(questionRaw)
-		iconsB64 := base64.StdEncoding.EncodeToString(iconsRaw)
-		return c.JSON(http.StatusOK, SuccessResp(CaptchaChallenge{
-			ID:       captchaErr.ChallengeID,
-			Question: questionB64,
-			Icons:    iconsB64,
-		}))
-	} else if err != nil {
-		return c.JSON(http.StatusInternalServerError, ErrorResp(500, err.Error()))
+	challenge, err := getCaptchaChallenge(bot)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResp(http.StatusInternalServerError, err.Error()))
 	}
-	return c.JSON(http.StatusOK, SuccessResp(CaptchaChallenge{}))
+	return c.JSON(http.StatusOK, SuccessResp(challenge))
 }
 
 // GetPublicIPHandler ...

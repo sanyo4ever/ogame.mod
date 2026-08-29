@@ -62,6 +62,12 @@ func (b *OGame) loginWithBearerToken(token, phpSessID string) (bool, bool, error
 	var didPart1n2 bool
 	var server gameforge.Server
 	var userAccount gameforge.Account
+	// A manually solved CAPTCHA belongs to the next full Gameforge login.
+	// Do not let a stale bearer/PHP session bypass postSessions and lose it.
+	if b.hasSolvedCaptcha() {
+		token = ""
+		phpSessID = ""
+	}
 	if token != "" && phpSessID != "" {
 		var err error
 		if server, userAccount, err = b.loginPart1(token); err == nil {
