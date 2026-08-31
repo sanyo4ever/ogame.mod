@@ -966,13 +966,14 @@ func isSessionRedirect(statusCode int, location, referenceURL, serverURL string)
 }
 
 // isNormalDiscoveryRedirect identifies the redirect returned by OGame after
-// the v13 discovery action. The action is applied before OGame redirects back
-// to an in-game page, so this is a successful protocol response, not a login
-// redirect. The fleet state is still reconciled by sendDiscoveryFleet before
+// either v13 discovery action. The action is applied before OGame redirects
+// back to an in-game page, so this is a successful protocol response, not a
+// login redirect. The fleet state is still reconciled by the caller before
 // the operation is reported as successful.
 func isNormalDiscoveryRedirect(method string, vals url.Values, statusCode int, location, serverURL string) bool {
 	if method != http.MethodPost || vals.Get("page") != "ingame" ||
-		vals.Get("component") != "fleetdispatch" || vals.Get("action") != "sendDiscoveryFleet" {
+		vals.Get("component") != "fleetdispatch" ||
+		(vals.Get("action") != "sendDiscoveryFleet" && vals.Get("action") != "sendSystemDiscoveryFleet") {
 		return false
 	}
 	actionURL := strings.TrimRight(serverURL, "/") + "/game/index.php"
@@ -2323,6 +2324,14 @@ func (b *OGame) highscore(category, typ, page int64) (out ogame.Highscore, err e
 }
 
 func (b *OGame) getAllResources() (map[ogame.CelestialID]ogame.Resources, error) {
+	if isOgameV13(b) {
+		pageHTML, _, err := b.getV13AuctionPage(0)
+		if err != nil {
+			return nil, err
+		}
+		return b.extractor.ExtractAllResources(pageHTML)
+	}
+
 	vals := url.Values{
 		"page":      {"ajax"},
 		"component": {"traderauctioneer"},
@@ -2596,6 +2605,19 @@ func (b *OGame) activateItem(ref string, celestialID ogame.CelestialID) error {
 }
 
 func (b *OGame) getAuction(celestialID ogame.CelestialID) (ogame.Auction, error) {
+	if isOgameV13(b) {
+		auctionHTML, token, err := b.getV13AuctionPage(celestialID)
+		if err != nil {
+			return ogame.Auction{}, err
+		}
+		auction, err := b.extractor.ExtractAuction(auctionHTML)
+		if err != nil {
+			return ogame.Auction{}, err
+		}
+		auction.Token = token
+		return auction, nil
+	}
+
 	payload := url.Values{"show": {"auctioneer"}, "ajax": {"1"}}
 	auctionHTML, err := b.postPageContent(url.Values{"page": {"ajax"}, "component": {"traderauctioneer"}}, payload, ChangePlanet(celestialID))
 	if err != nil {
@@ -2629,13 +2651,20 @@ func (b *OGame) doAuction(celestialID ogame.CelestialID, bid map[ogame.Celestial
 
 	payload.Add("bid[honor]", "0")
 	payload.Add("token", auction.Token)
-	payload.Add("ajax", "1")
 
 	if celestialID != 0 {
 		payload.Set("cp", utils.FI64(celestialID))
 	}
 
-	auctionHTML, err := b.postPageContent(url.Values{"page": {"ajax"}, "component": {"traderauctioneer"}, "ajax": {"1"}, "action": {"submitBid"}, "asJson": {"1"}}, payload)
+	vals := url.Values{"page": {"ajax"}, "component": {"traderauctioneer"}, "ajax": {"1"}, "action": {"submitBid"}, "asJson": {"1"}}
+	if isOgameV13(b) {
+		payload.Add("action", "auctioneerSubmitBid")
+		vals = url.Values{"page": {"ingame"}, "component": {"trader"}, "asJson": {"1"}}
+	} else {
+		payload.Add("ajax", "1")
+	}
+
+	auctionHTML, err := b.postPageContent(vals, payload)
 	if err != nil {
 		return err
 	}
@@ -2663,14 +2692,106 @@ func (b *OGame) doAuction(celestialID ogame.CelestialID, bid map[ogame.Celestial
 		}
 	*/
 
-	var jsonObj map[string]any
-	if err := json.Unmarshal(auctionHTML, &jsonObj); err != nil {
+	return parseAuctionBidResponse(auctionHTML)
+}
+
+type v13TraderAjaxResponse struct {
+	Content struct {
+		Trader string `json:"trader"`
+	} `json:"content"`
+	NewAjaxToken string `json:"newAjaxToken"`
+}
+
+func (b *OGame) getV13AuctionPage(celestialID ogame.CelestialID) ([]byte, string, error) {
+	initial, err := b.postPageContent(
+		url.Values{
+			"page":      {"ingame"},
+			"component": {"trader"},
+			"tab":       {"auctioneer"},
+			"ajax":      {"1"},
+		},
+		nil,
+		ChangePlanet(celestialID),
+	)
+	if err != nil {
+		return nil, "", err
+	}
+
+	initialResponse, err := parseV13TraderAjaxResponse(initial)
+	if err != nil {
+		return nil, "", err
+	}
+
+	action, err := b.postPageContent(
+		url.Values{
+			"page":      {"ingame"},
+			"component": {"trader"},
+			"action":    {"auctioneer"},
+			"ajax":      {"1"},
+		},
+		url.Values{
+			"action": {"auctioneer"},
+			"token":  {initialResponse.NewAjaxToken},
+			"ajax":   {"1"},
+		},
+		ChangePlanet(celestialID),
+	)
+	if err != nil {
+		return nil, "", err
+	}
+
+	actionResponse, err := parseV13TraderAjaxResponse(action)
+	if err != nil {
+		return nil, "", err
+	}
+	return []byte(actionResponse.Content.Trader), actionResponse.NewAjaxToken, nil
+}
+
+func parseV13TraderAjaxResponse(body []byte) (v13TraderAjaxResponse, error) {
+	var response v13TraderAjaxResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return response, errors.New("failed to parse v13 trader response: " + err.Error())
+	}
+	if strings.TrimSpace(response.Content.Trader) == "" {
+		return response, errors.New("v13 trader response did not contain trader content")
+	}
+	if strings.TrimSpace(response.NewAjaxToken) == "" {
+		return response, errors.New("v13 trader response did not contain a new ajax token")
+	}
+	return response, nil
+}
+
+func parseAuctionBidResponse(body []byte) error {
+	var response struct {
+		Error   *bool  `json:"error"`
+		Success *bool  `json:"success"`
+		Message string `json:"message"`
+		Errors  []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
 		return err
 	}
-	if jsonObj["error"] == true {
-		return errors.New(jsonObj["message"].(string))
+	if len(response.Errors) > 0 && strings.TrimSpace(response.Errors[0].Message) != "" {
+		return errors.New(response.Errors[0].Message)
 	}
-	return nil
+	if response.Error != nil && *response.Error {
+		if response.Message == "" {
+			response.Message = "auction bid was rejected"
+		}
+		return errors.New(response.Message)
+	}
+	if response.Success != nil && !*response.Success {
+		if response.Message == "" {
+			response.Message = "auction bid was rejected"
+		}
+		return errors.New(response.Message)
+	}
+	if (response.Error != nil && !*response.Error) || (response.Success != nil && *response.Success) {
+		return nil
+	}
+	return errors.New("auction bid response did not confirm success")
 }
 
 func calcResources(price int64, planetResources ogame.PlanetResources, multiplier ogame.Multiplier) url.Values {
@@ -4972,52 +5093,162 @@ func (b *OGame) sendSystemDiscoveryFleet(celestialID ogame.CelestialID, galaxy, 
 	if _, ok := galaxyPage.System.CanSendSystemDiscovery.(string); ok {
 		return nil, errors.New("can't send system discovery")
 	}
+	origin, err := b.getCachedCelestialByID(celestialID)
+	if err != nil {
+		return nil, err
+	}
+	initialFleets, _, err := b.getFleets(SkipRetry)
+	if err != nil {
+		return nil, err
+	}
+	initialFleetIDs := discoveryFleetIDsForSystem(initialFleets, origin.GetCoordinate(), galaxy, system)
+
 	// Send fleets.
 	res, err := b.postPageContent(url.Values{
 		"page":      {"ingame"},
 		"component": {"fleetdispatch"},
 		"action":    {"sendSystemDiscoveryFleet"},
+		"ajax":      {"1"},
 		"asJson":    {"1"},
 	}, url.Values{
 		"galaxy": {utils.FI64(galaxy)},
 		"system": {utils.FI64(system)},
 		"token":  {actionToken},
-	})
+	}, append(options, SkipRetry)...)
 	if err != nil {
+		var redirectErr *requestRedirectError
+		if errors.As(err, &redirectErr) && redirectErr.normal {
+			return b.confirmSystemDiscoveryFleetDispatched(celestialID, galaxy, system, initialFleetIDs)
+		}
 		return nil, err
 	}
-	var resStruct struct {
-		Response struct {
+	return parseSystemDiscoveryActionResponse(res)
+}
+
+func parseSystemDiscoveryActionResponse(body []byte) ([]ogame.Coordinate, error) {
+	var payload struct {
+		Success           *bool  `json:"success"`
+		Message           string `json:"message"`
+		SentToCoordinates []struct {
+			Galaxy   int64 `json:"galaxy"`
+			System   int64 `json:"system"`
+			Position int64 `json:"position"`
+		} `json:"sentToCoordinates"`
+		Response *struct {
+			Success           *bool  `json:"success"`
 			Message           string `json:"message"`
-			ShipsSent         int    `json:"shipsSent"`
 			SentToCoordinates []struct {
 				Galaxy   int64 `json:"galaxy"`
 				System   int64 `json:"system"`
 				Position int64 `json:"position"`
 			} `json:"sentToCoordinates"`
-			Discovery struct {
-				CanSendDiscovery any    `json:"canSendDiscovery"` // `true` or `"Maximum number of fleets reached."`
-				DiscoveryCount   string `json:"discoveryCount"`
-				GalaxyHeader     struct {
-					LocaGalaxyLifeformDiscoveryCount string `json:"LOCA_GALAXY_LIFEFORM_DISCOVERY_COUNT"`
-				} `json:"galaxyHeader"`
-			} `json:"discovery"`
-			Success bool `json:"success"`
 		} `json:"response"`
-		NewAjaxToken string `json:"newAjaxToken"`
 	}
-	if err := json.Unmarshal(res, &resStruct); err != nil {
+	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, errors.New("failed to unmarshal response: " + err.Error())
 	}
-	if !resStruct.Response.Success {
-		return nil, errors.New(resStruct.Response.Message)
+
+	success := payload.Success
+	message := strings.TrimSpace(payload.Message)
+	coordinates := payload.SentToCoordinates
+	if payload.Response != nil {
+		if success == nil {
+			success = payload.Response.Success
+		}
+		if message == "" {
+			message = strings.TrimSpace(payload.Response.Message)
+		}
+		if len(coordinates) == 0 {
+			coordinates = payload.Response.SentToCoordinates
+		}
 	}
-	coordinates := make([]ogame.Coordinate, 0)
-	for _, resCoord := range resStruct.Response.SentToCoordinates {
-		coord := ogame.NewPlanetCoordinate(resCoord.Galaxy, resCoord.System, resCoord.Position)
-		coordinates = append(coordinates, coord)
+	if success == nil {
+		return nil, errors.New("OGame returned a system discovery response without a success field")
 	}
-	return coordinates, nil
+	if !*success {
+		if message == "" {
+			message = "OGame rejected the system discovery fleet request"
+		}
+		return nil, errors.New(message)
+	}
+	if len(coordinates) == 0 {
+		return nil, errors.New("OGame accepted the system discovery request without reporting sent coordinates")
+	}
+
+	out := make([]ogame.Coordinate, 0, len(coordinates))
+	for _, resCoord := range coordinates {
+		out = append(out, ogame.NewPlanetCoordinate(resCoord.Galaxy, resCoord.System, resCoord.Position))
+	}
+	return out, nil
+}
+
+func discoveryFleetIDsForSystem(fleets []ogame.Fleet, origin ogame.Coordinate, galaxy, system int64) map[ogame.FleetID]struct{} {
+	ids := make(map[ogame.FleetID]struct{})
+	for _, fleet := range fleets {
+		if fleet.Mission == ogame.SearchForLifeforms &&
+			!fleet.ReturnFlight && fleet.Origin.Equal(origin) &&
+			fleet.Destination.Galaxy == galaxy && fleet.Destination.System == system {
+			ids[fleet.ID] = struct{}{}
+		}
+	}
+	return ids
+}
+
+func (b *OGame) confirmSystemDiscoveryFleetDispatched(celestialID ogame.CelestialID, galaxy, system int64, initialFleetIDs map[ogame.FleetID]struct{}) ([]ogame.Coordinate, error) {
+	origin, err := b.getCachedCelestialByID(celestialID)
+	if err != nil {
+		return nil, err
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		fleets, _, err := b.getFleets(SkipRetry)
+		if err == nil {
+			coordinates := make([]ogame.Coordinate, 0)
+			seen := make(map[string]struct{})
+			for _, fleet := range fleets {
+				_, wasActiveBefore := initialFleetIDs[fleet.ID]
+				if fleet.Mission != ogame.SearchForLifeforms || fleet.ID <= 0 || wasActiveBefore ||
+					fleet.ReturnFlight || !fleet.Origin.Equal(origin.GetCoordinate()) ||
+					fleet.Destination.Galaxy != galaxy || fleet.Destination.System != system {
+					continue
+				}
+				key := fmt.Sprintf("%d:%d:%d", fleet.Destination.Galaxy, fleet.Destination.System, fleet.Destination.Position)
+				if _, exists := seen[key]; exists {
+					continue
+				}
+				seen[key] = struct{}{}
+				coordinates = append(coordinates, fleet.Destination)
+			}
+			if len(coordinates) > 0 {
+				return coordinates, nil
+			}
+		} else {
+			lastErr = err
+		}
+
+		if attempt < 2 {
+			timer := time.NewTimer(300 * time.Millisecond)
+			select {
+			case <-timer.C:
+			case <-b.parentCtx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return nil, b.parentCtx.Err()
+			case <-b.ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return nil, ogame.ErrBotInactive
+			}
+		}
+	}
+
+	if lastErr != nil {
+		return nil, fmt.Errorf("unable to verify system discovery fleet dispatch: %w", lastErr)
+	}
+	return nil, errors.New("unable to verify system discovery fleet dispatch")
 }
 
 func (b *OGame) getAvailableDiscoveries(opts ...Option) (int64, error) {

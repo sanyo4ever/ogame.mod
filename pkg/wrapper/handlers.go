@@ -1274,6 +1274,45 @@ func SendDiscoveryHandler(c echo.Context) error {
 	return c.JSON(http.StatusOK, SuccessResp(true))
 }
 
+// SendSystemDiscoveryHandler sends one discovery fleet to every currently
+// eligible position reported by OGame for a system.
+func SendSystemDiscoveryHandler(c echo.Context) error {
+	bot := c.Get("bot").(*OGame)
+	planetID, err := utils.ParseI64(c.Param("planetID"))
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResp(400, "invalid planet id"))
+	}
+
+	if err := c.Request().ParseForm(); err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResp(400, "invalid form"))
+	}
+
+	var galaxy, system int64
+	for key, values := range c.Request().PostForm {
+		if len(values) == 0 {
+			continue
+		}
+		switch key {
+		case "galaxy":
+			galaxy, err = utils.ParseI64(values[0])
+		case "system":
+			system, err = utils.ParseI64(values[0])
+		}
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, ErrorResp(400, "invalid system discovery coordinates"))
+		}
+	}
+	if galaxy <= 0 || system <= 0 {
+		return c.JSON(http.StatusBadRequest, ErrorResp(400, "galaxy and system are required"))
+	}
+
+	coordinates, err := bot.SendSystemDiscoveryFleet(ogame.CelestialID(planetID), galaxy, system)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, ErrorResp(400, err.Error()))
+	}
+	return c.JSON(http.StatusOK, SuccessResp(coordinates))
+}
+
 // GetAlliancePageContentHandler ...
 func GetAlliancePageContentHandler(c echo.Context) error {
 	bot := c.Get("bot").(*OGame)

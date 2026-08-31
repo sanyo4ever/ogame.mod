@@ -254,6 +254,48 @@ func TestDiscoveryRedirectIsClassifiedAsNormalInternalAction(t *testing.T) {
 	))
 }
 
+func TestDiscoverySystemRedirectIsClassifiedAsNormalInternalAction(t *testing.T) {
+	serverURL := "https://s176-pt.ogame.gameforge.com"
+	vals := url.Values{
+		"page":      {"ingame"},
+		"component": {"fleetdispatch"},
+		"action":    {"sendSystemDiscoveryFleet"},
+	}
+
+	assert.True(t, isNormalDiscoveryRedirect(
+		http.MethodPost,
+		vals,
+		http.StatusFound,
+		serverURL+"/game/index.php?page=componentOnly&component=fleetdispatch",
+		serverURL,
+	))
+	assert.False(t, isNormalDiscoveryRedirect(
+		http.MethodPost,
+		vals,
+		http.StatusFound,
+		"https://lobby.gameforge.com/login",
+		serverURL,
+	))
+}
+
+func TestDiscoverySystemResponseReturnsTheCoordinatesActuallySent(t *testing.T) {
+	coordinates, err := parseSystemDiscoveryActionResponse([]byte(`{
+		"response": {
+			"success": true,
+			"sentToCoordinates": [
+				{"galaxy": 2, "system": 275, "position": 4},
+				{"galaxy": 2, "system": 275, "position": 7}
+			]
+		}
+	}`))
+
+	assert.NoError(t, err)
+	assert.Equal(t, []ogame.Coordinate{
+		ogame.NewPlanetCoordinate(2, 275, 4),
+		ogame.NewPlanetCoordinate(2, 275, 7),
+	}, coordinates)
+}
+
 func TestPostPageContentDoesNotTreatDiscoveryRedirectAsLogout(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
