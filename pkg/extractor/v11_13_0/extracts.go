@@ -83,7 +83,7 @@ func extractFleetsFromDoc(doc *goquery.Document, location *time.Location, lifefo
 		}
 
 		timerNextID := s.Find("span.nextTimer").AttrOr("id", "")
-		m = regexp.MustCompile(`getElementByIdWithCache\("` + timerNextID + `"\),\s*(\d+)\s*\);`).FindStringSubmatch(script)
+		m = regexp.MustCompile(`getElementById(?:WithCache)?\("` + regexp.QuoteMeta(timerNextID) + `"\),\s*(\d+)`).FindStringSubmatch(script)
 		var backIn int64
 		if len(m) == 2 {
 			backIn = utils.DoParseI64(m[1])
