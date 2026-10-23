@@ -1,5 +1,13 @@
 <img src="./logo.png" width="300" />
 
+## sanyo4ever maintenance fork
+
+Our maintained branch is [`main`](https://github.com/sanyo4ever/ogame.mod/tree/main), based on [0xE232FE/ogame.mod](https://github.com/0xE232FE/ogame.mod) and the original work by [alaingilbert](https://github.com/alaingilbert/ogame). Existing attribution and the MIT license are retained.
+
+This backend is pinned and packaged by [sanyo4ever/TBot](https://github.com/sanyo4ever/TBot). Its CI runs the Go tests/build on Windows and Ubuntu. TBot's workflow builds `./cmd/ogamed-tbot` for seven platforms and creates our releases; the legacy GoReleaser configuration is not invoked by CI. The original `github.com/alaingilbert/ogame` module path is retained so internal imports resolve to this checkout without a large import rewrite.
+
+For a local backend build: `go test ./...` followed by `go build -o ogamed ./cmd/ogamed-tbot` (use `ogamed.exe` on Windows). Develop changes on short branches targeting our `main`, then update TBot's exact submodule SHA after review. Do not move TBot to a floating dependency or overwrite its upstream contribution branches.
+
 [![discord](https://img.shields.io/discord/546546108277719052.svg)](https://discord.gg/4dZtZpz)
 
 # OGame automation toolkit
