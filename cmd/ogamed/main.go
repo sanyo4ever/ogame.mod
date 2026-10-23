@@ -159,7 +159,6 @@ func main() {
 			Sources: cli.EnvVars("OGAMED_DEVICENAME"),
 		},
 	}
-	app.Flags = append(app.Flags, defenderFlags...)
 	app.Action = start
 	if err := app.Run(context.Background(), os.Args); err != nil {
 		log.Fatal(err)
@@ -262,8 +261,6 @@ func start(ctx context.Context, c *cli.Command) error {
 	e.HideBanner = true
 	e.HidePort = true
 	e.Debug = false
-
-	wireDefender(c, bot, e)
 
 	e.GET("/", wrapper.HomeHandler)
 	e.GET("/tasks", wrapper.TasksHandler)

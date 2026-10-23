@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/alaingilbert/ogame/cmd/ogamed-tbot/buildqueue"
 	"github.com/alaingilbert/ogame/pkg/device"
 	"github.com/alaingilbert/ogame/pkg/gameforge"
 	"github.com/alaingilbert/ogame/pkg/httpclient"
@@ -484,30 +483,6 @@ func start(ctx context.Context, c *cli.Command) error {
 	e.GET("/headerCache/*", GetStaticHandler)
 	e.GET("/favicon.ico", GetStaticHandler)
 	e.GET("/game/sw.js", GetStaticHandler)
-
-	tmplString, err := os.ReadFile(`D:\TBot\develop-ogamed-tbot\cmd\ogamed-tbot\buildqueue\build_queue.gohtml`)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	store, err := buildqueue.NewBoltStore(bot.GetUsername() + "-" + bot.GetUniverseName() + "-" + bot.GetLanguage() + "-queues.db")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer store.Close()
-
-	h, err := buildqueue.NewHandler(bot, string(tmplString), store)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	e.GET("/build-queue", h.Page)
-	e.POST("/build-queue/queue", h.QueueAdd)
-	e.POST("/build-queue/queue/:uid", h.QueueRemove)
-	e.PUT("/build-queue/queue", h.QueueReorder)
-	e.DELETE("/build-queue/queue", h.QueueClear)
-
-	e.POST("/build-queue/execute", h.Execute)
 
 	// JSON API
 	/*
