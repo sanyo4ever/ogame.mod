@@ -470,6 +470,19 @@ func extractLfBonusesFromDoc(doc *goquery.Document) (ogame.LfBonuses, error) {
 			}
 		}
 	}
+	for _, item := range doc.Find("lifeform-level-bonuses lifeform-item").EachIter() {
+		icon := item.Find(".lifeform-item-icon")
+		level, err := utils.ParseI64(strings.TrimSpace(item.Find(".currentlevel strong").Text()))
+		if err != nil || level < 0 {
+			continue
+		}
+		for _, lifeform := range []ogame.LifeformType{ogame.Humans, ogame.Rocktal, ogame.Mechas, ogame.Kaelesh} {
+			if icon.HasClass("lifeform" + utils.FI64(int64(lifeform))) {
+				b.LifeformLevels[lifeform] = level
+				break
+			}
+		}
+	}
 	return *b, nil
 }
 

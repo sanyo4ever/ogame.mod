@@ -2135,7 +2135,16 @@ func (b *OGame) highscore(category, typ, page int64) (out ogame.Highscore, err e
 		"site":     {utils.FI64(page)},
 	}
 	payload := url.Values{}
-	pageHTML, err := b.postPageContent(vals, payload)
+	var pageHTML []byte
+	if ogVersion, versionErr := version.NewVersion(sanitizeServerVersion(b.cache.serverData.Version)); versionErr == nil && isVGreaterThanOrEqual(ogVersion, "13.0.0") {
+		// OGame 13 removed highscoreContent; the full component contains
+		// the same ranking table and its pagination metadata.
+		vals.Set("page", "ingame")
+		vals.Set("component", HighscorePageName)
+		pageHTML, err = b.getPageContent(vals)
+	} else {
+		pageHTML, err = b.postPageContent(vals, payload)
+	}
 	if err != nil {
 		return out, err
 	}
@@ -3013,6 +3022,9 @@ func (b *OGame) getFacilities(celestialID ogame.CelestialID, options ...Option) 
 }
 
 func (b *OGame) getTechs(celestialID ogame.CelestialID) (ogame.Techs, error) {
+	if ogVersion, err := version.NewVersion(sanitizeServerVersion(b.cache.serverData.Version)); err == nil && isVGreaterThanOrEqual(ogVersion, "13.0.0") {
+		return b.getTechsFromComponents(celestialID)
+	}
 	vals := url.Values{"page": {FetchTechsName}}
 	page, err := getAjaxPage[parser.FetchTechsAjaxPage](b, vals, ChangePlanet(celestialID))
 	if err != nil {
