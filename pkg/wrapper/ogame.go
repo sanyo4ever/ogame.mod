@@ -906,7 +906,7 @@ func (b *OGame) preRequestChecks() error {
 	return nil
 }
 
-func (b *OGame) execRequest(method, finalURL string, payload, vals url.Values) ([]byte, error) {
+func (b *OGame) execRequest(method, finalURL string, payload, vals url.Values, requireSuccessfulHTTP bool) ([]byte, error) {
 	var body io.Reader
 	if method == http.MethodPost {
 		body = strings.NewReader(payload.Encode())
@@ -939,6 +939,19 @@ func (b *OGame) execRequest(method, finalURL string, payload, vals url.Values) (
 		return []byte{}, err
 	}
 	defer resp.Body.Close()
+
+	if requireSuccessfulHTTP && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices) {
+		return nil, fmt.Errorf("discovery movement read returned HTTP %d", resp.StatusCode)
+	}
+
+	// Discovery is a state-changing action. Preserve its HTTP result instead
+	// of accepting a success-looking body from an error or redirect response.
+	if isSingleDiscoveryAction(method, vals) && resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusFound && isInternalDiscoveryRedirect(resp.Header.Get("Location"), finalURL, b.cache.serverURL) {
+			return nil, errDiscoveryInternalRedirect
+		}
+		return nil, fmt.Errorf("discovery dispatch returned HTTP %d; dispatch outcome is unconfirmed", resp.StatusCode)
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		b.error("bad status | vals:" + vals.Encode() + " | " + resp.Status)
@@ -1022,6 +1035,12 @@ func (b *OGame) postPageContent(vals, payload url.Values, opts ...Option) ([]byt
 }
 
 func (b *OGame) pageContent(method string, vals, payload url.Values, opts ...Option) ([]byte, error) {
+	return b.pageContentWithHTTPStatus(method, vals, payload, false, opts...)
+}
+
+// Discovery proof reads require an original successful response. Other callers
+// retain their existing transport and parsing behavior.
+func (b *OGame) pageContentWithHTTPStatus(method string, vals, payload url.Values, requireSuccessfulHTTP bool, opts ...Option) ([]byte, error) {
 	cfg := getOptions(opts...)
 
 	if err := b.preRequestChecks(); err != nil {
@@ -1038,7 +1057,7 @@ func (b *OGame) pageContent(method string, vals, payload url.Values, opts ...Opt
 	var pageHTMLBytes []byte
 
 	clb := func() (err error) {
-		if method == http.MethodPost || vals.Get("component") == "support" {
+		if method == http.MethodPost || vals.Get("component") == "support" || requireSuccessfulHTTP {
 			// Needs to be inside the withRetry, so if we need to re-login the redirect is back for the login call
 			// Prevent redirect (301) https://stackoverflow.com/a/38150816/4196220
 			// Content returned on "support" endpoint:
@@ -1052,7 +1071,7 @@ func (b *OGame) pageContent(method string, vals, payload url.Values, opts ...Opt
 			return err
 		}
 
-		pageHTMLBytes, err = b.execRequest(method, finalURL, payload, vals)
+		pageHTMLBytes, err = b.execRequest(method, finalURL, payload, vals, requireSuccessfulHTTP)
 		if err != nil {
 			return err
 		}
@@ -2836,6 +2855,9 @@ func (b *OGame) getGalaxyPage(galaxy int64, system int64, opts ...Option) (*Gala
 	}
 	// Parse the json result, only defining the type for the GalaxyContent (Position and AvailableMissions properties).
 	var res GalaxyPageContent
+	if err = validateAjaxResult(by, "galaxy", false); err != nil {
+		return nil, err
+	}
 	if err = json.Unmarshal(by, &res); err != nil {
 		return nil, err
 	}
@@ -4379,84 +4401,12 @@ func (b *OGame) getTasks() (out taskRunner.TasksOverview) {
 }
 
 func (b *OGame) sendDiscoveryFleet(celestialID ogame.CelestialID, coord ogame.Coordinate, options ...Option) error {
-	options = append(options, ChangePlanet(celestialID))
-	// Check if the sendDiscoveryFleet button is available for the target.
-	// This checks for the envoys technology, if the planet has enough resources, if there's fleet slots available and if there's no cooldown on the position.
-	galaxyPage, err := b.getGalaxyPage(coord.Galaxy, coord.System, options...)
-	if err != nil {
-		return err
-	}
-	for _, position := range galaxyPage.System.GalaxyContent {
-		if position.Position == coord.Position {
-			for _, availableMission := range position.AvailableMissions {
-				if availableMission.MissionType == ogame.SearchForLifeforms {
-					errMsg := "can't send discovery mission"
-					if canSend, ok := availableMission.CanSend.(bool); ok {
-						if !canSend {
-							return errors.New(errMsg)
-						}
-					} else if canSendStr, ok := availableMission.CanSend.(string); ok {
-						return errors.New(errMsg + ": " + canSendStr)
-					}
-				}
-			}
-		}
-	}
-
-	// Send fleet.
-	res, err := b.postPageContent(url.Values{
-		"page":      {"ingame"},
-		"component": {"fleetdispatch"},
-		"action":    {"sendDiscoveryFleet"},
-		"ajax":      {"1"},
-		"asJson":    {"1"},
-	}, url.Values{
-		"galaxy":   {utils.FI64(coord.Galaxy)},
-		"system":   {utils.FI64(coord.System)},
-		"position": {utils.FI64(coord.Position)},
-		"token":    {galaxyPage.Token},
-	})
-	if err != nil {
-		return err
-	}
-
-	var resStruct struct {
-		Response struct {
-			Success bool   `json:"success"`
-			Message string `json:"message"`
-		} `json:"response"`
-		Components   []any  `json:"components"`
-		NewAjaxToken string `json:"newAjaxToken"`
-	}
-	if err := json.Unmarshal(res, &resStruct); err != nil {
-		return errors.New("failed to unmarshal response: " + err.Error())
-	}
-	if !resStruct.Response.Success {
-		return errors.New(resStruct.Response.Message)
-	}
-	return nil
+	_, err := b.dispatchDiscoveryFleet(celestialID, coord, false, options...)
+	return err
 }
 
 func (b *OGame) sendDiscoveryFleet2(celestialID ogame.CelestialID, coord ogame.Coordinate, options ...Option) (ogame.Fleet, error) {
-	if err := b.sendDiscoveryFleet(celestialID, coord, options...); err != nil {
-		return ogame.Fleet{}, err
-	}
-	select {
-	case <-time.After(utils.RandMs(250, 500)):
-	case <-b.parentCtx.Done():
-		return ogame.Fleet{}, b.parentCtx.Err()
-	case <-b.ctx.Done():
-		return ogame.Fleet{}, ogame.ErrBotInactive
-	}
-	c, err := b.getCachedCelestial(celestialID)
-	if err != nil {
-		return ogame.Fleet{}, err
-	}
-	fleet, err := b.getLastFleetFor(c.GetCoordinate(), coord, ogame.SearchForLifeforms)
-	if err != nil {
-		return ogame.Fleet{}, err
-	}
-	return fleet, nil
+	return b.dispatchDiscoveryFleet(celestialID, coord, true, options...)
 }
 
 func (b *OGame) sendSystemDiscoveryFleet(celestialID ogame.CelestialID, galaxy, system int64, options ...Option) ([]ogame.Coordinate, error) {
@@ -4552,8 +4502,9 @@ func (b *OGame) getPositionsAvailableForDiscoveryFleet(galaxy int64, system int6
 	availablePositions := make([]ogame.Coordinate, 0)
 	for _, position := range galaxyPage.System.GalaxyContent {
 		for _, availableMission := range position.AvailableMissions {
-			if availableMission.CanSend == true {
+			if availableMission.MissionType == ogame.SearchForLifeforms && availableMission.CanSend == true {
 				availablePositions = append(availablePositions, ogame.Coordinate{Galaxy: galaxy, System: system, Position: position.Position, Type: ogame.PlanetType})
+				break
 			}
 		}
 	}
