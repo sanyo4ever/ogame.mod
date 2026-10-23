@@ -312,7 +312,10 @@ func CancelFleetHandler(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, ErrorResp(400, err.Error()))
 	}
-	return c.JSON(http.StatusOK, SuccessResp(bot.CancelFleet(ogame.FleetID(fleetID))))
+	if err := bot.CancelFleet(ogame.FleetID(fleetID)); err != nil {
+		return c.JSON(http.StatusInternalServerError, ErrorResp(500, err.Error()))
+	}
+	return c.JSON(http.StatusOK, SuccessResp(nil))
 }
 
 // GetAttacksHandler ...
@@ -1640,15 +1643,15 @@ func GetCaptchaSolverHandler(c echo.Context) error {
 	answer := utils.DoParseI64(c.Request().PostFormValue("answer"))
 
 	if err := gameforge.SolveChallenge(bot.ctx, bot.GetClient(), challengeID, answer); err != nil {
-		bot.error(err)
+		return c.JSON(http.StatusInternalServerError, ErrorResp(500, err.Error()))
 	}
 
 	if !bot.IsLoggedIn() {
 		if err := bot.Login(); err != nil {
-			bot.error(err)
+			return c.JSON(http.StatusInternalServerError, ErrorResp(500, err.Error()))
 		}
 	}
-	return c.Redirect(http.StatusTemporaryRedirect, "/")
+	return c.JSON(http.StatusOK, SuccessResp(nil))
 }
 
 // CaptchaChallenge ...

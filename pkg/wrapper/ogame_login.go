@@ -13,6 +13,7 @@ import (
 	"github.com/alaingilbert/ogame/pkg/extractor/v11_15_0"
 	"github.com/alaingilbert/ogame/pkg/extractor/v11_9_0"
 	"github.com/alaingilbert/ogame/pkg/extractor/v12_0_0"
+	"github.com/alaingilbert/ogame/pkg/extractor/v13_0_0"
 	v7 "github.com/alaingilbert/ogame/pkg/extractor/v7"
 	v71 "github.com/alaingilbert/ogame/pkg/extractor/v71"
 	v8 "github.com/alaingilbert/ogame/pkg/extractor/v8"
@@ -276,8 +277,15 @@ func isVGreaterThanOrEqual(v *version.Version, compareVersion string) bool {
 	return v.GreaterThanOrEqual(version.Must(version.NewVersion(compareVersion)))
 }
 
+func isOgameV13(b *OGame) bool {
+	v, err := version.NewVersion(sanitizeServerVersion(b.cache.serverData.Version))
+	return err == nil && isVGreaterThanOrEqual(v, "13.0.0")
+}
+
 func getExtractorFor(ogVersion *version.Version) (ext extractor.Extractor) {
-	if isVGreaterThanOrEqual(ogVersion, "12.0.0") {
+	if isVGreaterThanOrEqual(ogVersion, "13.0.0") {
+		ext = v13_0_0.NewExtractor()
+	} else if isVGreaterThanOrEqual(ogVersion, "12.0.0") {
 		ext = v12_0_0.NewExtractor()
 	} else if isVGreaterThanOrEqual(ogVersion, "11.15.0") {
 		ext = v11_15_0.NewExtractor()
