@@ -3535,14 +3535,31 @@ func (b *OGame) sendFleet(celestialID ogame.CelestialID, ships ogame.ShipsInfos,
 	if err != nil {
 		return zeroFleet, err
 	}
-	var checkRes CheckTargetResponse
+	var checkRes struct {
+		CheckTargetResponse
+		// Preserve field presence without changing the public TargetOk bool API.
+		TargetOk json.RawMessage `json:"targetOk"`
+		Success  json.RawMessage `json:"success"`
+		Error    json.RawMessage `json:"error"`
+	}
 	if err := json.Unmarshal(by1, &checkRes); err != nil {
 		return zeroFleet, err
 	}
 
-	if !checkRes.TargetOk && checkRes.Message != "ok" {
-		if len(checkRes.Errors) > 0 {
-			return zeroFleet, errors.New(checkRes.Errors[0].Message + " (" + strconv.Itoa(checkRes.Errors[0].Error) + ")")
+	if len(checkRes.Errors) > 0 {
+		return zeroFleet, errors.New(checkRes.Errors[0].Message + " (" + strconv.Itoa(checkRes.Errors[0].Error) + ")")
+	}
+	targetOk := string(bytes.TrimSpace(checkRes.TargetOk))
+	success := string(bytes.TrimSpace(checkRes.Success))
+	errorResult := string(bytes.TrimSpace(checkRes.Error))
+	// OGame 13 can omit targetOk. Require a positive result as well as status;
+	// retain the existing message=ok form only when success is absent.
+	targetAccepted := targetOk == "true" || (targetOk == "" && checkRes.Status == "success" &&
+		(success == "true" || (success == "" && checkRes.Message == "ok")))
+	if !targetAccepted || (checkRes.Status != "" && checkRes.Status != "success") ||
+		(success != "" && success != "true") || (errorResult != "" && errorResult != "false") {
+		if message := strings.TrimSpace(checkRes.Message); message != "" && message != "ok" {
+			return zeroFleet, errors.New(message)
 		}
 		return zeroFleet, errors.New("target is not ok")
 	}
