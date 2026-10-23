@@ -17,7 +17,7 @@ builds:
   ignore:
   - goos: darwin
     goarch: 386
-  main: ./cmd/ogamed-tbot/main.go
+  main: ./cmd/ogamed-tbot
   ldflags: -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
   binary: ogamed
 archives:
