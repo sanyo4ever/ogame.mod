@@ -16,7 +16,7 @@ func TestExtractEspionageReport(t *testing.T) {
 	e.SetLocation(time.FixedZone("OGT", 3600))
 	infos, err := e.ExtractEspionageReport(pageHTMLBytes)
 	assert.NoError(t, err)
-	assert.Equal(t, time.Date(2024, 05, 23, 21, 20, 42, 0, time.UTC), infos.Date.UTC()) // "23.05.2024 22:20:42" at OGT (UTC+1)
+	assert.Equal(t, time.Date(2024, 05, 23, 22, 20, 42, 0, time.FixedZone("OGT", 3600)).UTC(), infos.Date.UTC()) // "23.05.2024 22:20:42" in OGT (+01:00)
 	assert.Equal(t, "Hmoa", infos.Username)
 	assert.Equal(t, ogame.Collector, infos.CharacterClass)
 	assert.Equal(t, int64(2_920_000), infos.Resources.Metal)
@@ -36,6 +36,36 @@ func TestExtractLfBonuses(t *testing.T) {
 	assert.Equal(t, -0.0019, bonuses.LfShipBonuses[ogame.LightFighterID].FuelConsumption)
 	assert.Equal(t, 0.006, bonuses.CostTimeBonuses[ogame.AllianceDepotID].Cost)
 	assert.Equal(t, 0.012, bonuses.CostTimeBonuses[ogame.AllianceDepotID].Duration)
+}
+
+func TestExtractLfBonusesV13(t *testing.T) {
+	pageHTML := []byte(`
+<bonus-item-content data-toggable-target="ships"><bonus-item-content-holder>
+  <inner-bonus-item-heading data-toggable="202"><bonus-items>
+    <bonus-item>-</bonus-item><bonus-item>-</bonus-item><bonus-item>-</bonus-item>
+    <bonus-item>3.04%</bonus-item><bonus-item>4.87%</bonus-item><bonus-item>-0.13%</bonus-item>
+  </bonus-items></inner-bonus-item-heading>
+</bonus-item-content-holder></bonus-item-content>
+<bonus-item-content data-toggable-target="costreduction"><bonus-item-content-holder>
+  <inner-bonus-item-heading data-toggable="114"><bonus-items>
+    <bonus-item>-</bonus-item><bonus-item>1.11%</bonus-item>
+  </bonus-items></inner-bonus-item-heading>
+</bonus-item-content-holder></bonus-item-content>
+<bonus-item-content data-toggable-target="expedition"><bonus-item-content-holder>
+  <inner-bonus-item-heading data-toggable="ResultBooster"><div class="subCategoryBonus">2.23%</div></inner-bonus-item-heading>
+</bonus-item-content-holder></bonus-item-content>
+<bonus-item-content data-toggable-target="characterclasses"><bonus-item-content-holder>
+  <inner-bonus-item-heading data-toggable="603"><div class="subCategoryBonus">Total: 1.5%</div></inner-bonus-item-heading>
+</bonus-item-content-holder></bonus-item-content>`)
+
+	bonuses, err := NewExtractor().ExtractLfBonuses(pageHTML)
+	assert.NoError(t, err)
+	assert.Equal(t, 0.0304, bonuses.LfShipBonuses[ogame.SmallCargoID].Speed)
+	assert.Equal(t, 0.0487, bonuses.LfShipBonuses[ogame.SmallCargoID].CargoCapacity)
+	assert.Equal(t, -0.0013, bonuses.LfShipBonuses[ogame.SmallCargoID].FuelConsumption)
+	assert.Equal(t, 0.0111, bonuses.CostTimeBonuses[ogame.HyperspaceTechnologyID].Duration)
+	assert.Equal(t, 0.0223, bonuses.LfResourceBonuses.ResourcesExpedition)
+	assert.Equal(t, 0.015, bonuses.CharacterClassesBonuses.Characterclasses3)
 }
 
 func TestExtractAllianceClass(t *testing.T) {

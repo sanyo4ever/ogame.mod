@@ -62,6 +62,12 @@ func (b *OGame) loginWithBearerToken(token, phpSessID string) (bool, bool, error
 	var didPart1n2 bool
 	var server gameforge.Server
 	var userAccount gameforge.Account
+	// A manually solved CAPTCHA belongs to the next full Gameforge login.
+	// Do not let a stale bearer/PHP session bypass postSessions and lose it.
+	if b.hasSolvedCaptcha() {
+		token = ""
+		phpSessID = ""
+	}
 	if token != "" && phpSessID != "" {
 		var err error
 		if server, userAccount, err = b.loginPart1(token); err == nil {
@@ -278,8 +284,10 @@ func isVGreaterThanOrEqual(v *version.Version, compareVersion string) bool {
 }
 
 func isOgameV13(b *OGame) bool {
-	v, err := version.NewVersion(sanitizeServerVersion(b.cache.serverData.Version))
-	return err == nil && isVGreaterThanOrEqual(v, "13.0.0")
+	if ogVersion, err := version.NewVersion(sanitizeServerVersion(b.cache.serverData.Version)); err == nil {
+		return isVGreaterThanOrEqual(ogVersion, "13.0.0")
+	}
+	return false
 }
 
 func getExtractorFor(ogVersion *version.Version) (ext extractor.Extractor) {

@@ -4,16 +4,15 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"regexp"
-	"strconv"
-	"strings"
-	"time"
-
 	"github.com/PuerkitoBio/goquery"
 	v6 "github.com/alaingilbert/ogame/pkg/extractor/v6"
 	"github.com/alaingilbert/ogame/pkg/ogame"
 	"github.com/alaingilbert/ogame/pkg/utils"
 	"golang.org/x/net/html"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
 )
 
 func extractCombatReportMessagesFromDoc(doc *goquery.Document) ([]ogame.CombatReportSummary, int64, error) {
@@ -459,17 +458,6 @@ func extractExpeditionMessagesFromDoc(doc *goquery.Document, location *time.Loca
 
 func extractLfBonusesFromDoc(doc *goquery.Document) (ogame.LfBonuses, error) {
 	b := ogame.NewLfBonuses()
-	for _, s := range doc.Find("bonus-item-content[data-toggable-target^=category]").EachIter() {
-		category := s.AttrOr("data-toggable-target", "")
-		if category == "categoryShips" || category == "categoryCostAndTime" || category == "categoryResources" || category == "categoryCharacterclasses" || category == "categoryMisc" {
-			for _, g := range s.Find("inner-bonus-item-heading[data-toggable^=subcategory]").EachIter() {
-				category, subcategory := extractCategories(g, category)
-				if category != "" && subcategory != "" {
-					assignBonusValue(g, b, category, subcategory)
-				}
-			}
-		}
-	}
 	for _, item := range doc.Find("lifeform-level-bonuses lifeform-item").EachIter() {
 		icon := item.Find(".lifeform-item-icon")
 		level, err := utils.ParseI64(strings.TrimSpace(item.Find(".currentlevel strong").Text()))
@@ -483,7 +471,62 @@ func extractLfBonusesFromDoc(doc *goquery.Document) (ogame.LfBonuses, error) {
 			}
 		}
 	}
+	if extractLfBonusesV13(doc, b) {
+		return *b, nil
+	}
+	for _, s := range doc.Find("bonus-item-content[data-toggable-target^=category]").EachIter() {
+		category := s.AttrOr("data-toggable-target", "")
+		if category == "categoryShips" || category == "categoryCostAndTime" || category == "categoryResources" || category == "categoryCharacterclasses" || category == "categoryMisc" {
+			for _, g := range s.Find("inner-bonus-item-heading[data-toggable^=subcategory]").EachIter() {
+				category, subcategory := extractCategories(g, category)
+				if category != "" && subcategory != "" {
+					assignBonusValue(g, b, category, subcategory)
+				}
+			}
+		}
+	}
 	return *b, nil
+}
+
+// extractLfBonusesV13 handles the component markup used by OGame v13. The
+// legacy parser below relies on categoryShips/subcategoryShips attributes,
+// while v13 exposes the same information as direct section headings.
+func extractLfBonusesV13(doc *goquery.Document, b *ogame.LfBonuses) bool {
+	ships := doc.Find(`bonus-item-content[data-toggable-target="ships"]`).First()
+	costReduction := doc.Find(`bonus-item-content[data-toggable-target="costreduction"]`).First()
+	expedition := doc.Find(`bonus-item-content[data-toggable-target="expedition"]`).First()
+	characterClasses := doc.Find(`bonus-item-content[data-toggable-target="characterclasses"]`).First()
+	if ships.Length() == 0 && costReduction.Length() == 0 && expedition.Length() == 0 && characterClasses.Length() == 0 {
+		return false
+	}
+
+	for _, heading := range directLfBonusHeadings(ships).EachIter() {
+		extractShipStatBonus(heading, b, heading.AttrOr("data-toggable", ""))
+	}
+	for _, heading := range directLfBonusHeadings(costReduction).EachIter() {
+		id := heading.AttrOr("data-toggable", "")
+		extractCostReductionBonus(heading, b, id)
+		extractTimeReductionBonus(heading, b, id)
+	}
+	for _, heading := range directLfBonusHeadings(expedition).EachIter() {
+		if heading.AttrOr("data-toggable", "") == "ResultBooster" {
+			b.LfResourceBonuses.ResourcesExpedition = extractBonusFromStringPercentage(
+				heading.Find("div.subCategoryBonus").First().Text())
+		}
+	}
+	for _, heading := range directLfBonusHeadings(characterClasses).EachIter() {
+		if heading.AttrOr("data-toggable", "") == "603" {
+			match := regexp.MustCompile(`[-+]?\d+(?:[.,]\d+)?`).FindString(
+				heading.Find("div.subCategoryBonus").First().Text())
+			b.CharacterClassesBonuses.Characterclasses3 = extractBonusFromStringPercentage(match)
+		}
+	}
+	return true
+}
+
+func directLfBonusHeadings(section *goquery.Selection) *goquery.Selection {
+	return section.ChildrenFiltered("bonus-item-content-holder").
+		ChildrenFiltered("inner-bonus-item-heading[data-toggable]")
 }
 
 func extractCategories(g *goquery.Selection, category string) (string, string) {
@@ -525,18 +568,6 @@ func assignBonusValue(s *goquery.Selection, b *ogame.LfBonuses, category string,
 func extractResourcesExpeditionBonus(s *goquery.Selection, l *ogame.LfBonuses) {
 	txt := s.Find("div.subCategoryBonus").First().Text()
 	l.LfResourceBonuses.ResourcesExpedition = extractBonusFromStringPercentage(txt)
-}
-
-func extractResourcesProductionBonus(s *goquery.Selection, l *ogame.LfBonuses, x string) {
-	txt := s.Find("div.subCategoryBonus").First().Text()
-	switch x {
-	case "0":
-		l.LfResourceBonuses.ResourcesMetalProduction = extractBonusFromStringPercentage(txt)
-	case "1":
-		l.LfResourceBonuses.ResourcesCrystalProduction = extractBonusFromStringPercentage(txt)
-	case "2":
-		l.LfResourceBonuses.ResourcesDeuteriumProduction = extractBonusFromStringPercentage(txt)
-	}
 }
 
 // Extracts cost reduction
@@ -628,4 +659,16 @@ func extractPhalanxNewToken(pageHTML []byte) (string, error) {
 	}
 	token := doc.Find("a.refreshPhalanxLink").AttrOr("data-overlay-token", "")
 	return token, nil
+}
+
+func extractResourcesProductionBonus(s *goquery.Selection, l *ogame.LfBonuses, x string) {
+	txt := s.Find("div.subCategoryBonus").First().Text()
+	switch x {
+	case "0":
+		l.LfResourceBonuses.ResourcesMetalProduction = extractBonusFromStringPercentage(txt)
+	case "1":
+		l.LfResourceBonuses.ResourcesCrystalProduction = extractBonusFromStringPercentage(txt)
+	case "2":
+		l.LfResourceBonuses.ResourcesDeuteriumProduction = extractBonusFromStringPercentage(txt)
+	}
 }

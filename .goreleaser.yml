@@ -1,8 +1,8 @@
 project_name: ogamed
 release:
   github:
-    owner: sanyo4ever
-    name: ogame.mod
+    owner: alaingilbert
+    name: ogame
   name_template: '{{.Tag}}'
 builds:
 - goos:
@@ -17,7 +17,7 @@ builds:
   ignore:
   - goos: darwin
     goarch: 386
-  main: ./cmd/ogamed-tbot
+  main: ./cmd/ogamed/main.go
   ldflags: -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
   binary: ogamed
 archives:

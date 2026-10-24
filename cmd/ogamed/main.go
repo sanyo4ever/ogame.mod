@@ -3,16 +3,15 @@ package main
 import (
 	"context"
 	"crypto/subtle"
-	"log"
-	"os"
-	"strconv"
-
 	"github.com/alaingilbert/ogame/pkg/device"
 	"github.com/alaingilbert/ogame/pkg/gameforge/solvers"
 	"github.com/alaingilbert/ogame/pkg/wrapper"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/urfave/cli/v3"
+	"log"
+	"os"
+	"strconv"
 )
 
 var version = "0.0.0"
@@ -170,8 +169,6 @@ func start(ctx context.Context, c *cli.Command) error {
 	username := c.String("username")
 	password := c.String("password")
 	language := c.String("language")
-	playerID := int64(c.Int("playerid"))
-	bearerToken := c.String("bearer")
 	autoLogin := c.Bool("auto-login")
 	host := c.String("host")
 	port := int(c.Int("port"))
@@ -201,7 +198,6 @@ func start(ctx context.Context, c *cli.Command) error {
 		SetScreenHeight(900).
 		SetTimezone("America/Los_Angeles").
 		SetLanguages("en-US,en").
-		SetUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36").
 		Build()
 	if err != nil {
 		panic(err)
@@ -214,8 +210,6 @@ func start(ctx context.Context, c *cli.Command) error {
 		Username:       username,
 		Password:       password,
 		Lang:           language,
-		PlayerID:       playerID,
-		BearerToken:    bearerToken,
 		AutoLogin:      autoLogin,
 		Proxy:          proxyAddr,
 		ProxyUsername:  proxyUsername,
@@ -261,7 +255,6 @@ func start(ctx context.Context, c *cli.Command) error {
 	e.HideBanner = true
 	e.HidePort = true
 	e.Debug = false
-
 	e.GET("/", wrapper.HomeHandler)
 	e.GET("/tasks", wrapper.TasksHandler)
 
@@ -330,6 +323,7 @@ func start(ctx context.Context, c *cli.Command) error {
 	e.GET("/bot/planets/:planetID/resources-buildings", wrapper.GetResourcesBuildingsHandler)
 	e.GET("/bot/planets/:planetID/lifeform-buildings", wrapper.GetLfBuildingsHandler)
 	e.GET("/bot/planets/:planetID/lifeform-techs", wrapper.GetLfResearchHandler)
+	e.GET("/bot/planets/:planetID/artifacts", wrapper.GetArtifactsHandler)
 	e.GET("/bot/planets/:planetID/defence", wrapper.GetDefenseHandler)
 	e.GET("/bot/planets/:planetID/ships", wrapper.GetShipsHandler)
 	e.GET("/bot/planets/:planetID/facilities", wrapper.GetFacilitiesHandler)
@@ -349,6 +343,7 @@ func start(ctx context.Context, c *cli.Command) error {
 	e.POST("/bot/planets/:planetID/check-fleet", wrapper.CheckFleetHandler)
 	e.POST("/bot/planets/:planetID/send-fleet", wrapper.SendFleetHandler)
 	e.POST("/bot/planets/:planetID/send-discovery", wrapper.SendDiscoveryHandler)
+	e.POST("/bot/planets/:planetID/send-system-discovery-bounded", wrapper.SendSystemDiscoveryBoundedHandler)
 	e.POST("/bot/planets/:planetID/send-ipm", wrapper.SendIPMHandler)
 	e.GET("/bot/moons/:moonID/phalanx/:galaxy/:system/:position", wrapper.PhalanxHandler)
 	e.POST("/bot/moons/:moonID/jump-gate", wrapper.JumpGateHandler)

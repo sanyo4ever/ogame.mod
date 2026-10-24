@@ -208,7 +208,7 @@ func TestCompatibilityCaptchaJSONAndErrors(t *testing.T) {
 		name                 string
 		failSolve, failLogin bool
 		want                 int
-	}{{"solved", false, false, 200}, {"solve failed", true, false, 500}, {"login failed", false, true, 500}} {
+	}{{"solved", false, false, 200}, {"solve failed", true, false, 502}, {"login failed", false, true, 500}} {
 		t.Run(tt.name, func(t *testing.T) {
 			requests := 0
 			bot := newCompatibilityTestBot(t, "13.0.0", func(req *http.Request) (*http.Response, error) {
@@ -359,7 +359,7 @@ func TestCompatibilityLifeformVersionDispatch(t *testing.T) {
 	for _, tt := range []struct {
 		ver  string
 		want float64
-	}{{"12.0.0", 0}, {"13.0.0", 0.01}} {
+	}{{"12.0.0", 0.01}, {"13.0.0", 0.01}} {
 		t.Run(tt.ver, func(t *testing.T) {
 			ext := getExtractorFor(version.Must(version.NewVersion(tt.ver)))
 			b, err := ext.ExtractLfBonuses(html)

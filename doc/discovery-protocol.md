@@ -1,17 +1,12 @@
-# Single discovery dispatch
+# Discovery dispatch and reservation boundaries
 
-This patch adapts the single-discovery safeguards from the MIT-licensed
-[Ronnie32/ogame.mod](https://github.com/ronnie32/ogame.mod) release source at
-`e9f365f803e15f937916ef152462f231b8676512`, specifically:
-
-- `b7f9e90cc5be47bfc43b92d7907746fff0134857`: redirect classification and a fleet watermark.
-- `33d070cb08247fc618e3def964355133ef9bc730`: use the freshly loaded galaxy page token.
-- `a0c8113077f54f7194495bde15da2862d9e3f8c8`: one discovery POST and explicit v13 response errors.
-
-The original MIT notice, Copyright (c) 2018 Alain Gilbert, remains in the root
-LICENSE. The new code is a narrow adaptation to this fork's existing transport
-and parsers. It does not import donor files, bulk-system discovery, login or PoW
-changes, dependencies, or replacements for existing protocol validators.
+This maintenance patch starts at the MIT-licensed Ronnie32/ogame.mod release
+`e9f365f803e15f937916ef152462f231b8676512` and ports the previously reviewed
+single-discovery safeguards from `32f18c61d800f2509645d5e4481378f0606cf25b`.
+The original donor work includes `b7f9e90`, `33d070c` and `a0c8113` (redirect
+classification, a fleet watermark, local galaxy token, and one-attempt dispatch).
+Ronnie's auction, CAPTCHA, message APIs and native system-discovery API remain.
+The original MIT notice, Copyright (c) 2018 Alain Gilbert, remains in LICENSE.
 
 The dispatch requires a target position with SearchForLifeforms mission 18 and
 literal boolean canSend=true, a nonempty page-scoped token, and a readable
@@ -72,3 +67,60 @@ also stays unconfirmed. A concurrent manual discovery with exactly the same
 route cannot be distinguished by an API without a server request identifier;
 this patch does not claim general fleet dispatch idempotency or account-wide
 serialization. The C# bridge must independently avoid POST retries.
+
+## Bounded system-discovery API
+
+`POST /bot/planets/:planetID/send-system-discovery-bounded` accepts form fields
+`galaxy`, `system`, `maxFleets`, and `positions`. Every field must appear once.
+The origin, galaxy and system must be positive. `maxFleets` must be 1 through
+15. `positions` is a comma-separated list of unique planet positions 1 through
+15, with a nonzero length no greater than `maxFleets`.
+
+For example, `galaxy=1&system=2&maxFleets=2&positions=3,7` authorizes at most two
+single-target discovery POSTs, in that order, only to planets [1:2:3] and [1:2:7].
+Missing, malformed, duplicate, out-of-range or excessive reservations return
+HTTP400 before any game request. Existing public Go signatures and interfaces
+remain source compatible; the concrete OGame/Prioritize types add
+`SendSystemDiscoveryFleetBounded(celestialID, galaxy, system, maxFleets,
+positions, options...) (SystemDiscoveryResult, error)`.
+
+The existing API response envelope wraps this result under `Result`:
+
+```json
+{"Status":"ok","Code":200,"Message":"","Result":{"coordinates":[{"Galaxy":1,"System":2,"Position":3,"Type":1}],"complete":false,"error":"discovery at [1:2:7] is incomplete: ..."}}
+```
+
+HTTP200 describes a valid request, including a partial result. `complete=true`
+means every supplied position has a unique proven new outgoing fleet. The
+`coordinates` array includes only proven launches, in reservation order; it is
+empty, rather than null, when nothing is proven. `error` is omitted on complete
+success. The Go error return covers invalid reservations; runtime failures are
+reported in the result so earlier successful launches survive.
+
+Each target refreshes its eligibility and local token, takes a complete strict
+watermark, makes one launch POST, and requires full movement proof. An expanded
+eligible set cannot add targets. Ineligibility, explicit rejection or uncertain
+outcome stops the sequence, returning its earlier proof. Never replay the whole
+request or the failed target. An uncertain launch may have consumed its reserved
+slot even when absent from `coordinates`; the caller must reconcile its current
+fleet/slot state before using that capacity again.
+
+OGame's native system action has no known supported server-side count/target
+limit. A preflight eligible count cannot close the eligibility-change race. The
+bounded endpoint therefore performs individual one-attempt launches; this costs
+more requests and does not claim native atomic bulk dispatch. It is serialized
+as one ordinary Go task, and stops at the first failure.
+
+The legacy `/send-system-discovery` route and `SendSystemDiscoveryFleet` method
+remain for released callers. They keep the native bulk action and coordinate
+result, with stricter errors, HTTP status checks and movement proof. They have
+**no reservation guarantee** and must not be used by a caller enforcing a slot
+budget. Their native redirect proof now uses all prior IDs and explicit movement
+evidence; positive JSON coordinates must stay in the requested system and be
+proven with the same watermark. This does not make the native action bounded.
+
+The final ordinary fleet launch POST also makes one attempt after an HTTP error
+or lost response. Its read-only `checkTarget` preflight remains retryable. The
+caller still owns ambiguous-launch reconciliation; neither route offers a
+server-side idempotency key or account-wide protection from concurrent manual
+launches on the same route.

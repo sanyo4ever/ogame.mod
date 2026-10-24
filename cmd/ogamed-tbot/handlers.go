@@ -389,7 +389,6 @@ func GetPositionsAvailableForDiscoveryFleet(c echo.Context) error {
 // curl 127.0.0.1:1234/bot/planets/:planetID/get-available-discoveries
 func GetAvailableDiscoveries(c echo.Context) error {
 	bot := c.Get("bot").(*wrapper.OGame)
-	bot.GetAvailableDiscoveries()
 
 	planetID, err := utils.ParseI64(c.Param("planetID"))
 	if err != nil {

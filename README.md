@@ -1,16 +1,12 @@
 <img src="./logo.png" width="300" />
 
-## sanyo4ever maintenance fork
-
-Our maintained branch is [`main`](https://github.com/sanyo4ever/ogame.mod/tree/main), based on [0xE232FE/ogame.mod](https://github.com/0xE232FE/ogame.mod) and the original work by [alaingilbert](https://github.com/alaingilbert/ogame). Existing attribution and the MIT license are retained.
-
-This backend is pinned and packaged by [sanyo4ever/TBot](https://github.com/sanyo4ever/TBot). Its CI runs the Go tests/build on Windows and Ubuntu. TBot's workflow builds `./cmd/ogamed-tbot` for seven platforms and creates our releases; the legacy GoReleaser configuration is not invoked by CI. The original `github.com/alaingilbert/ogame` module path is retained so internal imports resolve to this checkout without a large import rewrite.
-
-For a local backend build: `go test ./...` followed by `go build -o ogamed ./cmd/ogamed-tbot` (use `ogamed.exe` on Windows). Develop changes on short branches targeting our `main`, then update TBot's exact submodule SHA after review. Do not move TBot to a floating dependency or overwrite its upstream contribution branches.
-
 [![discord](https://img.shields.io/discord/546546108277719052.svg)](https://discord.gg/4dZtZpz)
 
 # OGame automation toolkit
+
+This maintenance fork is based on [Ronnie's v13 release branch](https://github.com/ronnie32/ogame.mod/tree/release/v13-beta10), with our applicable compatibility fixes carried forward. It supplies the pinned backend for [sanyo4ever/TBot-Ronnie](https://github.com/sanyo4ever/TBot-Ronnie). The changes are also proposed upstream in [Ronnie's PR #2](https://github.com/ronnie32/ogame.mod/pull/2).
+
+See [the discovery protocol](doc/discovery-protocol.md) for reservation, evidence and uncertain-result semantics. The TBot release pins an exact Go commit; a moving branch is not a release dependency. Go CI runs tests/builds on Linux and Windows without game credentials. Previous maintenance history is retained in the integration merge.
 
 - [As a library](#ogame-library)
 - [As a service (ogamed)](#ogamed-service)

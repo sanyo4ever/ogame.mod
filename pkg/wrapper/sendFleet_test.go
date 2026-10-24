@@ -101,6 +101,55 @@ func TestSendFleetHandlerCheckTargetError(t *testing.T) {
 	}
 }
 
+func TestSendFleetDoesNotReplayAcceptedPostWithLostOutcome(t *testing.T) {
+	for _, outcome := range []string{"HTTP500", "lost response"} {
+		t.Run(outcome, func(t *testing.T) {
+			bot, requests := newFleetTargetTestBot(t, `{"targetOk":true}`)
+			transport := bot.device.GetClient().Transport
+			accepted := 0
+			bot.device.GetClient().Transport = fleetTargetTransport(func(req *http.Request) (*http.Response, error) {
+				resp, err := transport.RoundTrip(req)
+				if req.Method == http.MethodPost && req.URL.Query().Get("action") == "sendFleet" {
+					accepted++ // The server applies the action before the outcome is lost.
+					if accepted == 1 {
+						_ = resp.Body.Close()
+						if outcome == "lost response" {
+							return nil, fmt.Errorf("synthetic connection lost after dispatch")
+						}
+						resp.StatusCode = http.StatusInternalServerError
+						resp.Status = "500 Internal Server Error"
+						resp.Body = io.NopCloser(strings.NewReader(`{"success":true}`))
+					}
+				}
+				return resp, err
+			})
+			_, err := bot.sendFleet(1, ogame.ShipsInfos{SmallCargo: 1}, ogame.HundredPercent,
+				ogame.NewPlanetCoordinate(1, 1, 2), ogame.Transport, ogame.Resources{}, 0, 0, false)
+			if err == nil || requests.sendFleet != 1 || accepted != 1 {
+				t.Fatalf("ambiguous dispatch was replayed: posts=%d accepted=%d error=%v", requests.sendFleet, accepted, err)
+			}
+		})
+	}
+}
+
+func TestSendFleetCheckTargetReadRemainsRetryable(t *testing.T) {
+	bot, requests := newFleetTargetTestBot(t, `{"targetOk":true}`)
+	transport := bot.device.GetClient().Transport
+	bot.device.GetClient().Transport = fleetTargetTransport(func(req *http.Request) (*http.Response, error) {
+		resp, err := transport.RoundTrip(req)
+		if req.URL.Query().Get("action") == "checkTarget" && requests.checkTarget == 1 {
+			resp.StatusCode = http.StatusInternalServerError
+			resp.Status = "500 Internal Server Error"
+		}
+		return resp, err
+	})
+	_, err := bot.sendFleet(1, ogame.ShipsInfos{SmallCargo: 1}, ogame.HundredPercent,
+		ogame.NewPlanetCoordinate(1, 1, 2), ogame.Transport, ogame.Resources{}, 0, 0, false)
+	if err == nil || requests.checkTarget != 2 || requests.sendFleet != 1 {
+		t.Fatalf("checks=%d sends=%d error=%v", requests.checkTarget, requests.sendFleet, err)
+	}
+}
+
 type fleetTargetRequests struct {
 	checkTarget int
 	sendFleet   int

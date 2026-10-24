@@ -8,11 +8,17 @@ import (
 	"github.com/alaingilbert/ogame/pkg/ogame"
 )
 
-// Extractor adds the OGame 13 bonus and trader markup to the legacy extractor.
-type Extractor struct{ v12_0_0.Extractor }
+// Extractor ...
+type Extractor struct {
+	v12_0_0.Extractor
+}
 
-func NewExtractor() *Extractor { return &Extractor{} }
+// NewExtractor ...
+func NewExtractor() *Extractor {
+	return &Extractor{}
+}
 
+// ExtractLfBonuses ...
 func (e *Extractor) ExtractLfBonuses(pageHTML []byte) (ogame.LfBonuses, error) {
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(pageHTML))
 	if err != nil {
@@ -21,6 +27,7 @@ func (e *Extractor) ExtractLfBonuses(pageHTML []byte) (ogame.LfBonuses, error) {
 	return e.ExtractLfBonusesFromDoc(doc)
 }
 
+// ExtractLfBonusesFromDoc ...
 func (e *Extractor) ExtractLfBonusesFromDoc(doc *goquery.Document) (ogame.LfBonuses, error) {
 	// Retain bonuses independent of the renamed categories, such as experience
 	// levels, when the embedded extractor supports them.
@@ -32,12 +39,22 @@ func (e *Extractor) ExtractLfBonusesFromDoc(doc *goquery.Document) (ogame.LfBonu
 	return bonuses, nil
 }
 
+// ExtractOfferOfTheDay ...
 func (e *Extractor) ExtractOfferOfTheDay(pageHTML []byte) (int64, string, ogame.PlanetResources, ogame.Multiplier, error) {
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(pageHTML))
 	if err != nil {
 		return 0, "", nil, ogame.Multiplier{}, err
 	}
-	return e.ExtractOfferOfTheDayFromDoc(doc)
+	return extractOfferOfTheDayFromDoc(doc)
+}
+
+// ExtractCancelFleetToken ...
+func (e *Extractor) ExtractCancelFleetToken(pageHTML []byte, fleetID ogame.FleetID) (string, error) {
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(pageHTML))
+	if err != nil {
+		return "", err
+	}
+	return extractCancelFleetTokenFromDoc(doc, fleetID)
 }
 
 func (e *Extractor) ExtractOfferOfTheDayFromDoc(doc *goquery.Document) (int64, string, ogame.PlanetResources, ogame.Multiplier, error) {

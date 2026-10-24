@@ -2,16 +2,444 @@ package wrapper
 
 import (
 	"bytes"
+	"errors"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/alaingilbert/ogame/pkg/device"
 	"github.com/alaingilbert/ogame/pkg/ogame"
 	"github.com/alaingilbert/ogame/pkg/utils"
 	"github.com/hashicorp/go-version"
 	"github.com/stretchr/testify/assert"
+	"log"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 )
+
+func TestParseDeleteAllMessagesResponse(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		wantErr error
+	}{
+		{
+			name:    "success",
+			payload: `{"status":"success","message":""}`,
+		},
+		{
+			name:    "application error",
+			payload: `{"status":"error","message":"invalid token"}`,
+			wantErr: errors.New("unable to delete messages: invalid token"),
+		},
+		{
+			name:    "malformed response",
+			payload: `not-json`,
+			wantErr: errors.New("unable to parse delete messages response"),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := parseDeleteAllMessagesResponse([]byte(test.payload))
+			if test.wantErr == nil {
+				if err != nil {
+					t.Fatalf("expected success, got %v", err)
+				}
+				return
+			}
+
+			if err == nil || err.Error() != test.wantErr.Error() {
+				t.Fatalf("expected error %q, got %v", test.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestParseMessagesResponse(t *testing.T) {
+	tests := []struct {
+		name       string
+		payload    string
+		want       []string
+		wantToken  string
+		wantErrMsg string
+	}{
+		{
+			name:      "v13 success response",
+			payload:   `{"status":"success","showPaginator":false,"messages":["<div data-msg-id=\"42\">one</div>","<div data-msg-id=\"43\">two</div>"],"newAjaxToken":"next-token"}`,
+			want:      []string{`<div data-msg-id="42">one</div>`, `<div data-msg-id="43">two</div>`},
+			wantToken: "next-token",
+		},
+		{
+			name:       "server failure",
+			payload:    `{"status":"failure","errors":[{"message":"invalid token"}]}`,
+			wantErrMsg: "invalid token",
+		},
+		{
+			name:       "malformed json",
+			payload:    `not-json`,
+			wantErrMsg: "unable to parse messages response",
+		},
+		{
+			name:       "message is not html string",
+			payload:    `{"status":"success","messages":[{"unexpected":"object"}]}`,
+			wantErrMsg: "messages[0] is not a string",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			messages, token, err := parseMessagesResponse([]byte(test.payload))
+			if test.wantErrMsg == "" {
+				if err != nil {
+					t.Fatalf("expected success, got %v", err)
+				}
+				assert.Equal(t, test.want, messages)
+				assert.Equal(t, test.wantToken, token)
+				return
+			}
+
+			if err == nil || !strings.Contains(err.Error(), test.wantErrMsg) {
+				t.Fatalf("expected error containing %q, got %v", test.wantErrMsg, err)
+			}
+		})
+	}
+}
+
+func TestMessagesRequestPayloadCarriesTheRequestedPage(t *testing.T) {
+	payload := buildMessagesPayload(3, EspionageMessagesTabID)
+
+	assert.Equal(t, "3", payload.Get("pagination"))
+	assert.Equal(t, "20", payload.Get("activeSubTab"))
+	assert.Equal(t, "false", payload.Get("showTrash"))
+}
+
+func TestCollectMessagesPagesPreservesPageOrderAndHonorsMaxPage(t *testing.T) {
+	pages := map[int]string{
+		1: `{"status":"success","messages":["<div data-page=\"1\">one</div>"]}`,
+		2: `{"status":"success","messages":["<div data-page=\"2\">two</div>"]}`,
+		3: `{"status":"success","messages":["<div data-page=\"3\">three</div>"]}`,
+	}
+	requestedPages := make([]int64, 0)
+	fetch := func(page int64) ([]byte, error) {
+		requestedPages = append(requestedPages, page)
+		return []byte(pages[int(page)]), nil
+	}
+	extractor := func(pageHTML []byte) ([]string, int64, error) {
+		text := string(pageHTML)
+		if strings.Contains(text, `data-page="1"`) {
+			return []string{"one"}, 3, nil
+		}
+		if strings.Contains(text, `data-page="2"`) {
+			return []string{"two"}, 3, nil
+		}
+		return []string{"three"}, 3, nil
+	}
+
+	all, err := collectMessagesPages(-1, fetch, extractor, nil)
+	if err != nil {
+		t.Fatalf("collect all pages: %v", err)
+	}
+	assert.Equal(t, []string{"one", "two", "three"}, all)
+	assert.Equal(t, []int64{1, 2, 3}, requestedPages)
+
+	requestedPages = requestedPages[:0]
+	limited, err := collectMessagesPages(2, fetch, extractor, nil)
+	if err != nil {
+		t.Fatalf("collect limited pages: %v", err)
+	}
+	assert.Equal(t, []string{"one", "two"}, limited)
+	assert.Equal(t, []int64{1, 2}, requestedPages)
+}
+
+func TestExtractMessagesPageOnlyExtractsTheRequestedPage(t *testing.T) {
+	payload := []byte(`{"status":"success","messages":["<div data-msg-id=\"41\">one</div>","<div data-msg-id=\"42\">two</div>"]}`)
+
+	items, err := extractMessagesPage(payload, 4, func(message []byte) ([]string, int64, error) {
+		if !strings.Contains(string(message), "data-msg-id") {
+			t.Fatalf("unexpected message payload: %s", message)
+		}
+		return []string{string(message)}, 40, nil
+	})
+
+	if err != nil {
+		t.Fatalf("extract page: %v", err)
+	}
+	assert.Len(t, items, 2)
+}
+
+func TestRedirectClassificationUsesTheRedirectTarget(t *testing.T) {
+	serverURL := "https://s176-pt.ogame.gameforge.com"
+	actionURL := serverURL + "/game/index.php?page=ingame&component=fleetdispatch"
+
+	assert.False(t, isSessionRedirect(
+		http.StatusFound,
+		serverURL+"/game/index.php?page=ingame&component=overview&displayError=1",
+		actionURL,
+		serverURL,
+	))
+	assert.True(t, isSessionRedirect(
+		http.StatusFound,
+		"https://lobby.gameforge.com/login",
+		actionURL,
+		serverURL,
+	))
+	assert.True(t, isSessionRedirect(
+		http.StatusFound,
+		serverURL+"/game/index.php?page=login",
+		actionURL,
+		serverURL,
+	))
+	assert.False(t, isSessionRedirect(
+		http.StatusFound,
+		"?page=ingame&component=overview",
+		actionURL,
+		serverURL,
+	))
+	assert.True(t, isSessionRedirect(http.StatusFound, "", actionURL, serverURL))
+	assert.False(t, isSessionRedirect(http.StatusOK, "", actionURL, serverURL))
+}
+
+func TestDiscoveryRedirectIsClassifiedAsNormalInternalAction(t *testing.T) {
+	serverURL := "https://s176-pt.ogame.gameforge.com"
+	vals := url.Values{
+		"page":      {"ingame"},
+		"component": {"fleetdispatch"},
+		"action":    {"sendDiscoveryFleet"},
+	}
+
+	assert.True(t, isNormalDiscoveryRedirect(
+		http.MethodPost,
+		vals,
+		http.StatusFound,
+		serverURL+"/game/index.php?page=ingame&component=overview&displayError=1",
+		serverURL,
+	))
+	assert.True(t, isNormalDiscoveryRedirect(
+		http.MethodPost,
+		vals,
+		http.StatusFound,
+		"?page=ingame&component=overview",
+		serverURL,
+	))
+	assert.True(t, isNormalDiscoveryRedirect(
+		http.MethodPost,
+		vals,
+		http.StatusFound,
+		serverURL+"/game/index.php?page=componentOnly&component=fleetdispatch",
+		serverURL,
+	))
+	assert.True(t, isNormalDiscoveryRedirect(
+		http.MethodPost,
+		vals,
+		http.StatusFound,
+		serverURL+"/game/index.php",
+		serverURL,
+	))
+	assert.False(t, isNormalDiscoveryRedirect(
+		http.MethodPost,
+		vals,
+		http.StatusFound,
+		"https://lobby.gameforge.com/login",
+		serverURL,
+	))
+	assert.False(t, isNormalDiscoveryRedirect(
+		http.MethodPost,
+		url.Values{"page": {"ingame"}, "component": {"fleetdispatch"}, "action": {"sendFleet"}},
+		http.StatusFound,
+		serverURL+"/game/index.php?page=ingame&component=overview",
+		serverURL,
+	))
+}
+
+func TestDiscoverySystemRedirectIsClassifiedAsNormalInternalAction(t *testing.T) {
+	serverURL := "https://s176-pt.ogame.gameforge.com"
+	vals := url.Values{
+		"page":      {"ingame"},
+		"component": {"fleetdispatch"},
+		"action":    {"sendSystemDiscoveryFleet"},
+	}
+
+	assert.True(t, isNormalDiscoveryRedirect(
+		http.MethodPost,
+		vals,
+		http.StatusFound,
+		serverURL+"/game/index.php?page=componentOnly&component=fleetdispatch",
+		serverURL,
+	))
+	assert.False(t, isNormalDiscoveryRedirect(
+		http.MethodPost,
+		vals,
+		http.StatusFound,
+		"https://lobby.gameforge.com/login",
+		serverURL,
+	))
+}
+
+func TestDiscoverySystemResponseReturnsTheCoordinatesActuallySent(t *testing.T) {
+	coordinates, err := parseSystemDiscoveryActionResponse([]byte(`{
+		"response": {
+			"success": true,
+			"sentToCoordinates": [
+				{"galaxy": 2, "system": 275, "position": 4},
+				{"galaxy": 2, "system": 275, "position": 7}
+			]
+		}
+	}`))
+
+	assert.NoError(t, err)
+	assert.Equal(t, []ogame.Coordinate{
+		ogame.NewPlanetCoordinate(2, 275, 4),
+		ogame.NewPlanetCoordinate(2, 275, 7),
+	}, coordinates)
+}
+
+func TestPostPageContentDoesNotTreatDiscoveryRedirectAsLogout(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.Redirect(w, r, "/game/index.php?page=ingame&component=overview&displayError=1", http.StatusFound)
+	}))
+	defer server.Close()
+
+	testDevice, err := device.NewBuilder("redirect-http-test").
+		SetTimezone("America/Los_Angeles").
+		SetOsName(device.Windows).
+		SetBrowserName(device.Chrome).
+		SetMemory(8).
+		SetHardwareConcurrency(4).
+		ScreenColorDepth(24).
+		SetScreenWidth(1920).
+		SetScreenHeight(1080).
+		Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bot, err := NewNoLogin(testDevice, "", "", "", "en")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bot.cache.serverURL = server.URL
+	bot.isLoggedInAtom.Store(true)
+	bot.isConnectedAtom.Store(true)
+	var logs bytes.Buffer
+	bot.SetLogger(log.New(&logs, "", 0))
+
+	_, err = bot.postPageContent(url.Values{
+		"page":      {"ingame"},
+		"component": {"fleetdispatch"},
+		"action":    {"sendDiscoveryFleet"},
+		"ajax":      {"1"},
+		"asJson":    {"1"},
+	}, url.Values{"token": {"test-token"}}, SkipRetry)
+	var redirectErr *requestRedirectError
+	assert.ErrorAs(t, err, &redirectErr)
+	assert.True(t, redirectErr.normal)
+	assert.False(t, errors.Is(err, ogame.ErrNotLogged))
+	assert.Equal(t, 1, requests)
+	assert.NotContains(t, logs.String(), "bad status")
+}
+
+func TestDiscoveryFleetSnapshotIgnoresOtherRoutes(t *testing.T) {
+	origin := ogame.Coordinate{Galaxy: 1, System: 2, Position: 3, Type: ogame.PlanetType}
+	destination := ogame.Coordinate{Galaxy: 1, System: 5, Position: 7, Type: ogame.PlanetType}
+	fleets := []ogame.Fleet{
+		{ID: 10, Mission: ogame.SearchForLifeforms, Origin: origin, Destination: destination},
+		{ID: 25, Mission: ogame.SearchForLifeforms, Origin: origin, Destination: ogame.Coordinate{Galaxy: 1, System: 6, Position: 7, Type: ogame.PlanetType}},
+		{ID: 40, Mission: ogame.Attack, Origin: origin, Destination: destination},
+	}
+	ids := discoveryFleetIDs(fleets, origin, destination)
+	assert.Contains(t, ids, ogame.FleetID(10))
+	assert.NotContains(t, ids, ogame.FleetID(25))
+	assert.NotContains(t, ids, ogame.FleetID(40))
+}
+
+func TestDiscoverySystemViewOnlyReturnsAvailableLifeformMissions(t *testing.T) {
+	page := &GalaxyPageContent{}
+	page.System.GalaxyContent = []GalaxyPositionContent{
+		{
+			Position: 3,
+			AvailableMissions: []GalaxyMissionContent{
+				{MissionType: ogame.Expedition, CanSend: true},
+			},
+		},
+		{
+			Position: 4,
+			AvailableMissions: []GalaxyMissionContent{
+				{MissionType: ogame.SearchForLifeforms, CanSend: false},
+			},
+		},
+		{
+			Position: 5,
+			AvailableMissions: []GalaxyMissionContent{
+				{MissionType: ogame.SearchForLifeforms, CanSend: true},
+			},
+		},
+	}
+
+	positions := availableDiscoveryPositions(page, 1, 10)
+	assert.Equal(t, []ogame.Coordinate{
+		{Galaxy: 1, System: 10, Position: 5, Type: ogame.PlanetType},
+	}, positions)
+}
+
+func TestInternalRedirectIsNotRetriedAsAStateChangingAction(t *testing.T) {
+	redirectErr := &requestRedirectError{
+		statusCode: http.StatusFound,
+		location:   "/game/index.php?page=ingame&component=overview&displayError=1",
+	}
+	assert.ErrorIs(t, redirectErr, ErrActionRedirect)
+
+	b, err := NewNoLogin(&device.Device{}, "", "", "", "")
+	assert.NoError(t, err)
+	b.isLoggedInAtom.Store(true)
+	calls := 0
+	err = b.withRetry(func() error {
+		calls++
+		return redirectErr
+	})
+	assert.ErrorIs(t, err, ErrActionRedirect)
+	assert.Equal(t, 1, calls)
+}
+
+func TestDiscoveryActionUsesTheSystemPageToken(t *testing.T) {
+	token, err := discoveryPageToken("page-token")
+	assert.NoError(t, err)
+	assert.Equal(t, "page-token", token)
+
+	// A token written by another worker must not be part of this decision.
+	assert.NotEqual(t, "other-worker-token", token)
+}
+
+func TestDiscoveryActionRejectsMissingSystemPageToken(t *testing.T) {
+	_, err := discoveryPageToken(" ")
+	assert.EqualError(t, err, "discovery page did not contain an action token")
+}
+
+func TestDiscoveryResponseParsesTopLevelV13BusyError(t *testing.T) {
+	err := parseDiscoveryActionResponse([]byte(`{"status":"failure","success":false,"errors":[{"message":"busy","error":100}],"error":{"message":"busy","error":100}}`))
+	var pendingErr *discoveryRequestPendingError
+	assert.ErrorAs(t, err, &pendingErr)
+	assert.ErrorIs(t, err, errDiscoveryRequestPending)
+	assert.Contains(t, err.Error(), "code 100")
+}
+
+func TestDiscoveryResponseParsesNestedSuccess(t *testing.T) {
+	err := parseDiscoveryActionResponse([]byte(`{"response":{"success":true}}`))
+	assert.NoError(t, err)
+}
+
+func TestServerErrorsArePropagatedToTheRetryLayer(t *testing.T) {
+	err := serverError(http.StatusServiceUnavailable, "503 Service Unavailable")
+
+	if err == nil {
+		t.Fatal("expected a server error to be returned")
+	}
+	assert.Contains(t, err.Error(), "503 Service Unavailable")
+	assert.NoError(t, serverError(http.StatusOK, "200 OK"))
+}
 
 func BenchmarkUserInfoRegex(b *testing.B) {
 	extractUserRegex := func(pageHTML []byte) (int, string) {

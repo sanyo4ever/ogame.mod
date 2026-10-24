@@ -18,11 +18,10 @@ import (
 
 // Adapted narrowly from Ronnie32/ogame.mod b7f9e90, 33d070c and a0c8113
 // (MIT; Copyright (c) 2018 Alain Gilbert). See doc/discovery-protocol.md.
-var errDiscoveryInternalRedirect = errors.New("discovery dispatch returned an internal redirect; dispatch outcome is unconfirmed")
-
-func isSingleDiscoveryAction(method string, vals url.Values) bool {
+func isDiscoveryAction(method string, vals url.Values) bool {
 	return method == http.MethodPost && vals.Get("page") == "ingame" &&
-		vals.Get("component") == "fleetdispatch" && vals.Get("action") == "sendDiscoveryFleet"
+		vals.Get("component") == "fleetdispatch" &&
+		(vals.Get("action") == "sendDiscoveryFleet" || vals.Get("action") == "sendSystemDiscoveryFleet")
 }
 
 func isInternalDiscoveryRedirect(location, referenceURL, serverURL string) bool {
@@ -170,7 +169,8 @@ func (b *OGame) dispatchDiscoveryFleet(celestialID ogame.CelestialID, coord ogam
 	}, url.Values{
 		"galaxy": {utils.FI64(coord.Galaxy)}, "system": {utils.FI64(coord.System)}, "position": {utils.FI64(coord.Position)}, "token": {pageToken},
 	}, sendOptions...)
-	if errors.Is(err, errDiscoveryInternalRedirect) {
+	var redirectErr *requestRedirectError
+	if errors.As(err, &redirectErr) && redirectErr.normal {
 		return b.confirmDiscoveryFleet(origin.GetCoordinate(), coord, initialIDs, readOptions...)
 	}
 	if err != nil {
