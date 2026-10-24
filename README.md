@@ -4,7 +4,7 @@
 
 # OGame automation toolkit
 
-This maintenance fork is based on [Ronnie's v13 release branch](https://github.com/ronnie32/ogame.mod/tree/release/v13-beta10), with our applicable compatibility fixes carried forward. It supplies the pinned backend for [sanyo4ever/TBot](https://github.com/sanyo4ever/TBot). The changes are also proposed upstream in [Ronnie's PR #2](https://github.com/ronnie32/ogame.mod/pull/2).
+This maintenance fork is based on [Ronnie's v13 release branch](https://github.com/ronnie32/ogame.mod/tree/release/v13-beta10), with our applicable compatibility fixes carried forward. It supplies the pinned backend for [sanyo4ever/TBot-Ronnie](https://github.com/sanyo4ever/TBot-Ronnie). The changes are also proposed upstream in [Ronnie's PR #2](https://github.com/ronnie32/ogame.mod/pull/2).
 
 See [the discovery protocol](doc/discovery-protocol.md) for reservation, evidence and uncertain-result semantics. The TBot release pins an exact Go commit; a moving branch is not a release dependency. Go CI runs tests/builds on Linux and Windows without game credentials. Previous maintenance history is retained in the integration merge.
 
