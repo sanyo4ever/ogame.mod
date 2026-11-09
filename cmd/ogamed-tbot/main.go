@@ -27,6 +27,7 @@ func main() {
 	app.Usage = "ogame deamon service"
 	app.Version = version
 	app.Flags = []cli.Flag{
+		manualModeTimeoutFlag(),
 		&cli.StringFlag{
 			Name:    "universe",
 			Usage:   "Universe name",
@@ -233,6 +234,7 @@ func start(ctx context.Context, c *cli.Command) error {
 	autoLogin := c.Bool("auto-login")
 	host := c.String("host")
 	port := int(c.Int("port"))
+	manualModeTimeout := time.Duration(c.Int("manual-mode-timeout-seconds")) * time.Second
 	proxyAddr := c.String("proxy")
 	proxyUsername := c.String("proxy-username")
 	proxyPassword := c.String("proxy-password")
@@ -342,16 +344,16 @@ func start(ctx context.Context, c *cli.Command) error {
 	if corsEnabled {
 		e.Use(middleware.CORS())
 	}
-	var manualModeTimeout map[string]*time.Timer = map[string]*time.Timer{}
-	var botMap map[string]wrapper.Prioritizable = map[string]wrapper.Prioritizable{}
+	manual := newManualMode(manualModeTimeout, func() wrapper.Prioritizable {
+		return bot.BeginNamed("manual mode")
+	})
 	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(ctx echo.Context) error {
 			ctx.Set("bot", bot)
 			ctx.Set("version", version)
 			ctx.Set("commit", commit)
 			ctx.Set("date", date)
-			ctx.Set("manualModeTimeout", manualModeTimeout)
-			ctx.Set("botMap", botMap)
+			ctx.Set("manualMode", manual)
 			return next(ctx)
 		}
 	})

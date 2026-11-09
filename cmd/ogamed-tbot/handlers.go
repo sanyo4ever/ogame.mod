@@ -2,12 +2,10 @@ package main
 
 import (
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/alaingilbert/ogame/pkg/ogame"
 	"github.com/alaingilbert/ogame/pkg/utils"
@@ -16,25 +14,8 @@ import (
 )
 
 func PostToggleManualModeHandler(c echo.Context) error {
-	bot := c.Get("bot").(*wrapper.OGame)
-	botMap := c.Get("botMap").(map[string]wrapper.Prioritizable)
-	txTimerMap := c.Get("manualModeTimeout").(map[string]*time.Timer)
-	txTimer := txTimerMap["timeout"]
-
-	locked, state := bot.GetState()
-	if locked && state == "manual mode" {
-		txTimer.Stop()
-		tx := botMap["tx"]
-		tx.Done()
-		return c.JSON(http.StatusOK, false)
-	} else {
-		txTimer = time.NewTimer(30 * time.Second)
-		txTimerMap["timeout"] = txTimer
-		tx := bot.BeginNamed("manual mode")
-		botMap["tx"] = tx
-		go ManualTimerTx(botMap, txTimer)
-		return c.JSON(http.StatusOK, true)
-	}
+	manual := c.Get("manualMode").(*manualMode)
+	return c.JSON(http.StatusOK, manual.Toggle())
 }
 
 // GetAllianceClassHandler ...
@@ -62,9 +43,7 @@ func GetExpeditionMessagesHandler(c echo.Context) error {
 // GetFromGameHandler ...
 func GetFromGameHandler(c echo.Context) error {
 	bot := c.Get("bot").(*wrapper.OGame)
-	botMap := c.Get("botMap").(map[string]wrapper.Prioritizable)
-	txTimerMap := c.Get("manualModeTimeout").(map[string]*time.Timer)
-	txTimer := txTimerMap["timeout"]
+	manual := c.Get("manualMode").(*manualMode)
 
 	vals := url.Values{"page": {"ingame"}, "component": {"overview"}}
 	if len(c.QueryParams()) > 0 {
@@ -72,9 +51,8 @@ func GetFromGameHandler(c echo.Context) error {
 	}
 	locked, state := bot.GetState()
 	var pageHTML []byte
-	if locked && state == "manual mode" {
-		tx := botMap["tx"]
-		txTimer.Reset(30 * time.Second)
+	if tx, release := manual.Acquire(); tx != nil {
+		defer release()
 		pageHTML, _ = tx.GetPageContent(vals)
 	} else {
 		pageHTML, _ = bot.GetPageContent(vals)
@@ -91,9 +69,7 @@ func GetFromGameHandler(c echo.Context) error {
 // PostToGameHandler ...
 func PostToGameHandler(c echo.Context) error {
 	bot := c.Get("bot").(*wrapper.OGame)
-	botMap := c.Get("botMap").(map[string]wrapper.Prioritizable)
-	txTimerMap := c.Get("manualModeTimeout").(map[string]*time.Timer)
-	txTimer := txTimerMap["timeout"]
+	manual := c.Get("manualMode").(*manualMode)
 
 	vals := url.Values{"page": {"ingame"}, "component": {"overview"}}
 	if len(c.QueryParams()) > 0 {
@@ -102,9 +78,8 @@ func PostToGameHandler(c echo.Context) error {
 	payload, _ := c.FormParams()
 	locked, state := bot.GetState()
 	var pageHTML []byte
-	if state == "manual mode" && locked {
-		txTimer.Reset(30 * time.Second)
-		tx := botMap["tx"]
+	if tx, release := manual.Acquire(); tx != nil {
+		defer release()
 		pageHTML, _ = tx.PostPageContent(vals, payload)
 	} else {
 		pageHTML, _ = bot.PostPageContent(vals, payload)
@@ -316,16 +291,6 @@ func getOptions(opts ...wrapper.Option) (out wrapper.Options) {
 		}
 	}
 	return
-}
-
-func ManualTimerTx(botMap map[string]wrapper.Prioritizable, txTimer *time.Timer) {
-	tx := botMap["tx"]
-	select {
-	case <-txTimer.C:
-		tx.Done()
-		log.Println("Manual Mode Expired!")
-		// do something for timeout, like change state
-	}
 }
 
 // GetLfBonusesHandler ...
