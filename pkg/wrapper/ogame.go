@@ -1051,7 +1051,7 @@ func (b *OGame) execRequest(method, finalURL string, payload, vals url.Values, r
 		statusCode: resp.StatusCode,
 		location:   resp.Header.Get("Location"),
 	}
-	if resp.StatusCode != http.StatusOK &&
+	if resp.StatusCode != http.StatusOK && !isSupportRedirect(method, vals, response) &&
 		!(isRedirectStatus(resp.StatusCode) && !isSessionRedirect(resp.StatusCode, response.location, finalURL, b.cache.serverURL)) {
 		b.error("bad status | vals:" + vals.Encode() + " | " + resp.Status)
 	}
@@ -1192,6 +1192,11 @@ func (b *OGame) pageContentWithHTTPStatus(method string, vals, payload url.Value
 		pageHTMLBytes, response, err = b.execRequest(method, finalURL, payload, vals, requireSuccessfulHTTP)
 		if err != nil {
 			return err
+		}
+
+		if isSupportRedirect(method, vals, response) {
+			pageHTMLBytes = supportRedirectPage(response.location)
+			return nil
 		}
 
 		if isRedirectStatus(response.statusCode) {
